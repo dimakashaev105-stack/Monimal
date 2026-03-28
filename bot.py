@@ -1,8 +1,8 @@
 """
-╔══════════════════════════════════════════════════════════════╗
-║   🌸  FECTIZ BOT  —  v3.0 FULL                             ║
-║   Все игры · Все функции · Минималистичный дизайн          ║
-╚══════════════════════════════════════════════════════════════╝
+╔══════════════════════════════════════╗
+║   🌸  FECTIZ BOT  —  v3.0           ║
+║   Minimalist · Все игры · Удобно    ║
+╚══════════════════════════════════════╝
 """
 
 import os, re, time, json, math, random, threading, sqlite3, string
@@ -19,11 +19,27 @@ from telebot.types import (
 load_dotenv()
 
 # ═══════════════════════════════════════════════════════════════
-# 1. КОНФИГ
+# 0. УДАЛЯЕМ WEBHOOK — ЭТО ВАЖНО!
 # ═══════════════════════════════════════════════════════════════
 
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
+
+# Создаём временный бот только для удаления webhook
+_temp_bot = TeleBot(TOKEN)
+try:
+    _temp_bot.delete_webhook()
+    print("✅ Webhook успешно удалён")
+except Exception as e:
+    print(f"⚠️ Ошибка удаления webhook: {e}")
+
+# Теперь создаём основной бот
+bot = TeleBot(TOKEN, threaded=True, num_threads=8)
+
+# ═══════════════════════════════════════════════════════════════
+# 1. КОНФИГ
+# ═══════════════════════════════════════════════════════════════
+
 DB_FILE = "economy.db"
 CURRENCY = "🌸"
 TICKER = "FECTZ"
@@ -56,6 +72,10 @@ STOCK_MAX_PER_USER = 5000
 STOCK_SELL_FEE = 0.03
 STOCK_COOLDOWN = 600
 STOCK_UPDATE_SEC = 1800
+
+# ... остальной код остаётся без изменений ...
+
+# ═══════════════════════════════════════════════════════════════
 
 # ═══════════════════════════════════════════════════════════════
 # 2. БАЗА ДАННЫХ
@@ -2170,6 +2190,9 @@ def interest_scheduler():
         except Exception as e:
             print(f"[interest] ошибка: {e}")
 
+# ЗАПУСК
+# ═══════════════════════════════════════════════════════════════
+
 if __name__ == "__main__":
     init_db()
     
@@ -2178,4 +2201,5 @@ if __name__ == "__main__":
     threading.Thread(target=lottery_scheduler, daemon=True).start()
     
     print("🚀 Бот запущен")
+    # infinity_polling уже использует polling, webhook удалён выше
     bot.infinity_polling(timeout=30, long_polling_timeout=30)
