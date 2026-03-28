@@ -1,36 +1,48 @@
 """
-╔══════════════════════════════════════╗
-║   🌸  ECONOMY BOT  —  v3.0          ║
-║   PostgreSQL · Webhook · Render      ║
-╚══════════════════════════════════════╝
+╔══════════════════════════════════════════════╗
+║   💎  ECON BOT  —  v3.0  ULTRA CLEAN       ║
+║   Minimalist · Smart · Feature-Rich         ║
+╚══════════════════════════════════════════════╝
 
-Изменения v3.0:
-  • SQLite → PostgreSQL (Supabase)
-  • polling → Webhook (Flask)
-  • Connection pool через psycopg2.pool
-  • Все запросы переписаны под %s placeholder
-  • Фиксы багов оригинала
+Архитектура:
+  • Один файл, 30 чётких блоков
+  • SQLite + WAL + connection pool (потокобезопасно)
+  • Только inline-кнопки — 0 reply-клавиатур
+  • Единая точка входа главного меню (home)
+  • Все деньги — целые числа
+  • Flood protection in-memory
+  • Групповые игры + ЛС-функционал
+
+Фичи:
+  КОШЕЛЁК    Баланс · Банк · Вклад · Кредит · Перевод · Чек
+  РАБОТА     5 профессий · кулдаун · случайные события
+  КЛИКЕР     Прокачка клика · бустеры
+  МАЙНИНГ    Фермы · авто-сбор · GPU-апгрейды
+  БИРЖА      1 акция · история · дивиденды · рыночный импакт
+  ИГРЫ (ЛС)  Кубик · Слоты · Рулетка · Мины · Краш · Башня · Лотерея
+  ИГРЫ (гр.) Рулетка · Кости · Слоты · Дуэль · КНБ · Чек · Краш
+  ТОП        Баланс · XP · Акции
+  КЛАН       Создать · Казна · Роли · Участники
+  МАГАЗИН    Товары · Инвентарь · Апгрейды
+  БОНУСЫ     Ежедневный стрик · Реферал · Промокод
+  ПРОФИЛЬ    Уровень · XP · Статистика · Ачивки
+  ДОНАТ      Telegram Stars → монеты
+  СОБЫТИЯ    Случайные метеоры · Налог · Bio-drop
+  АДМИН      Выдача · Ban · Промо · Рассылка · Стат
 """
 
 # ══════════════════════════════════════════════
 # 0. ЗАВИСИМОСТИ
 # ══════════════════════════════════════════════
 
-import os, re, time, math, random, threading
+import os, re, time, json, math, random, threading
 from contextlib import contextmanager
-from datetime import datetime
-
-import psycopg2
-import psycopg2.extras
-from psycopg2 import pool as pg_pool
-
-from flask import Flask, request, abort
-
+from datetime import datetime, timedelta
+import sqlite3
 from dotenv import load_dotenv
 import telebot
 from telebot.types import (
-    InlineKeyboardMarkup, InlineKeyboardButton,
-    LabeledPrice
+    InlineKeyboardMarkup, InlineKeyboardButton, LabeledPrice
 )
 
 load_dotenv()
@@ -39,210 +51,279 @@ load_dotenv()
 # 1. КОНФИГ
 # ══════════════════════════════════════════════
 
-TOKEN        = os.getenv("BOT_TOKEN")
-ADMIN_IDS    = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
-ALERT_CHAT   = int(os.getenv("ALERT_CHAT", "0"))
-DATABASE_URL = os.getenv("DATABASE_URL")          # postgres://user:pass@host:5432/db
-WEBHOOK_URL  = os.getenv("WEBHOOK_URL", "")       # https://your-app.onrender.com
-PORT         = int(os.getenv("PORT", 8443))
-CURRENCY     = "💵"
-TICKER       = "ECO"
+TOKEN       = os.getenv("BOT_TOKEN", "")
+ADMIN_IDS   = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
+ALERT_CHAT  = int(os.getenv("ALERT_CHAT", "0"))
+DB_FILE     = "econ_v3.db"
+CUR         = "💎"          # валюта
+TICKER      = "ECO"
 
-# Кулдауны (секунды)
-CD_CLICK   = 5
-CD_DAILY   = 86400
-CD_WORK    = 14400
-CD_MINE    = 3600
-CD_LOTTERY = 86400
+# ── Кулдауны (секунды) ──
+CD_CLICK    = 8
+CD_DAILY    = 86400
+CD_WORK     = 14_400      # 4 часа
+CD_MINE     = 3_600       # 1 час
+CD_LOTTERY  = 86400
 
-# Экономика
-TRANSFER_FEE      = 0.05
-BANK_RATE         = 0.01
-LOAN_RATE         = 0.10
-LOAN_MAX          = 50_000
-CLICK_BASE        = 100
-MINE_BASE         = 500
-WORK_BASE         = 1_500
-TICKET_PRICE      = 500
+# ── Экономика ──
+TRANSFER_FEE   = 0.05
+BANK_RATE      = 0.01     # 1%/сутки — обычный вклад
+TERM_RATE      = 0.04     # 4%/сутки — срочный вклад (7 дней lock)
+LOAN_RATE      = 0.10
+LOAN_MAX       = 100_000
+CLICK_BASE     = 150
+MINE_BASE      = 600
+WORK_BASE      = 2_000
+TICKET_PRICE   = 500
+CLAN_COST      = 5_000
 
-# Акции
-STOCK_UPDATE      = 1800
-STOCK_PRICE_START = 10_000
-STOCK_VOLATILITY  = 0.04
+# ── Акция ──
+STOCK_TICK      = 1_800   # обновление каждые 30 мин
+STOCK_START     = 10_000
+STOCK_VOL       = 0.04    # ±4%
 
+# ── Флуд-защита ──
+FLOOD_N, FLOOD_W, FLOOD_BAN = 12, 5, 300
+
+# ── Башня ──
+TOWER_LEVELS    = 10
+TOWER_MULT_BASE = 1.4     # множитель за уровень
+
+# ── Ачивки ──
+ACHIEVEMENTS = {
+    "first_click":  ("⚡ Первый клик",   "Сделай первый клик"),
+    "rich":         ("💰 Миллионер",     "Накопи 1 000 000"),
+    "gambler":      ("🎲 Игрок",         "Сыграй 100 игр"),
+    "investor":     ("📈 Инвестор",      "Купи акции впервые"),
+    "social":       ("👥 Социальный",    "Пригласи 5 игроков"),
+    "worker":       ("⚒️ Трудяга",       "Выйди на работу 30 раз"),
+    "miner":        ("⛏️ Шахтёр",        "Собери руду 50 раз"),
+    "streak_7":     ("🔥 Недельный",     "7 дней подряд бонус"),
+    "streak_30":    ("🔥🔥 Месячный",    "30 дней подряд бонус"),
+    "clan_owner":   ("🏰 Основатель",    "Создай клан"),
+}
 
 # ══════════════════════════════════════════════
-# 2. БАЗА ДАННЫХ — PostgreSQL
+# 2. БАЗА ДАННЫХ
 # ══════════════════════════════════════════════
 
-_pg_pool: pg_pool.ThreadedConnectionPool | None = None
+class _Pool:
+    def __init__(self, path, size=10):
+        self._path = path
+        self._size = size
+        self._pool: list[sqlite3.Connection] = []
+        self._lock = threading.Lock()
 
-def get_pg_pool() -> pg_pool.ThreadedConnectionPool:
-    global _pg_pool
-    if _pg_pool is None:
-        _pg_pool = pg_pool.ThreadedConnectionPool(
-            minconn=2, maxconn=10,
-            dsn=DATABASE_URL,
-            cursor_factory=psycopg2.extras.RealDictCursor
-        )
-    return _pg_pool
+    def get(self) -> sqlite3.Connection:
+        with self._lock:
+            if self._pool:
+                return self._pool.pop()
+        c = sqlite3.connect(self._path, timeout=30, check_same_thread=False)
+        c.row_factory = sqlite3.Row
+        c.execute("PRAGMA journal_mode=WAL")
+        c.execute("PRAGMA foreign_keys=ON")
+        c.execute("PRAGMA synchronous=NORMAL")
+        return c
 
+    def put(self, c: sqlite3.Connection):
+        with self._lock:
+            if len(self._pool) < self._size:
+                self._pool.append(c)
+            else:
+                c.close()
+
+_pool = _Pool(DB_FILE)
 
 @contextmanager
 def db():
-    """Контекстный менеджер для работы с БД."""
-    pool = get_pg_pool()
-    conn = pool.getconn()
+    c = _pool.get()
+    cur = c.cursor()
     try:
-        with conn.cursor() as cur:
-            yield cur
-        conn.commit()
+        yield cur
+        c.commit()
     except Exception:
-        conn.rollback()
+        c.rollback()
         raise
     finally:
-        pool.putconn(conn)
+        _pool.put(c)
 
 
 def init_db():
     with db() as c:
-        c.execute("""
+        c.executescript("""
         CREATE TABLE IF NOT EXISTS users (
-            id              BIGINT PRIMARY KEY,
+            id              INTEGER PRIMARY KEY,
             name            TEXT    DEFAULT '',
-            balance         BIGINT  DEFAULT 0,
-            bank            BIGINT  DEFAULT 0,
-            xp              BIGINT  DEFAULT 0,
-            daily_streak    INT     DEFAULT 0,
-            last_click      BIGINT  DEFAULT 0,
-            last_daily      BIGINT  DEFAULT 0,
-            last_work       BIGINT  DEFAULT 0,
-            last_mine       BIGINT  DEFAULT 0,
-            click_power     INT     DEFAULT 100,
-            total_earned    BIGINT  DEFAULT 0,
-            ref_by          BIGINT  DEFAULT 0,
+            balance         INTEGER DEFAULT 0,
+            bank            INTEGER DEFAULT 0,
+            xp              INTEGER DEFAULT 0,
+            daily_streak    INTEGER DEFAULT 0,
+            last_click      INTEGER DEFAULT 0,
+            last_daily      INTEGER DEFAULT 0,
+            last_work       INTEGER DEFAULT 0,
+            last_mine       INTEGER DEFAULT 0,
+            click_power     INTEGER DEFAULT 150,
+            total_earned    INTEGER DEFAULT 0,
+            total_games     INTEGER DEFAULT 0,
+            total_clicks    INTEGER DEFAULT 0,
+            total_works     INTEGER DEFAULT 0,
+            total_mines     INTEGER DEFAULT 0,
+            ref_by          INTEGER DEFAULT 0,
             ref_code        TEXT    UNIQUE,
-            premium_until   BIGINT  DEFAULT 0,
-            last_interest_calc BIGINT DEFAULT 0,
-            created_at      BIGINT  DEFAULT 0
+            ref_count       INTEGER DEFAULT 0,
+            premium_until   INTEGER DEFAULT 0,
+            achievements    TEXT    DEFAULT '[]',
+            bio_drop_claimed INTEGER DEFAULT 0,
+            last_interest   INTEGER DEFAULT 0,
+            created_at      INTEGER DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS term_deposits (
+            user_id     INTEGER PRIMARY KEY,
+            amount      INTEGER DEFAULT 0,
+            rate        REAL    DEFAULT 0.04,
+            locked_until INTEGER DEFAULT 0,
+            started_at  INTEGER DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS loans (
-            user_id  BIGINT PRIMARY KEY,
-            amount   BIGINT DEFAULT 0,
-            due_at   BIGINT DEFAULT 0,
-            taken_at BIGINT DEFAULT 0
+            user_id     INTEGER PRIMARY KEY,
+            amount      INTEGER DEFAULT 0,
+            due_at      INTEGER DEFAULT 0,
+            taken_at    INTEGER DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS stocks (
-            ticker      TEXT   PRIMARY KEY,
-            price       BIGINT DEFAULT 10000,
-            prev_price  BIGINT DEFAULT 10000,
-            updated_at  BIGINT DEFAULT 0
+            ticker      TEXT PRIMARY KEY,
+            price       INTEGER DEFAULT 10000,
+            prev_price  INTEGER DEFAULT 10000,
+            updated_at  INTEGER DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS portfolios (
-            user_id BIGINT,
+            user_id INTEGER,
             ticker  TEXT,
-            shares  INT    DEFAULT 0,
-            avg_buy BIGINT DEFAULT 0,
+            shares  INTEGER DEFAULT 0,
+            avg_buy INTEGER DEFAULT 0,
             PRIMARY KEY (user_id, ticker)
         );
         CREATE TABLE IF NOT EXISTS stock_history (
-            id     BIGSERIAL PRIMARY KEY,
-            ticker TEXT,
-            price  BIGINT,
-            ts     BIGINT DEFAULT 0
+            id      INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticker  TEXT,
+            price   INTEGER,
+            ts      INTEGER DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS lottery (
-            id      INT PRIMARY KEY DEFAULT 1,
-            jackpot BIGINT DEFAULT 0,
-            draw_at BIGINT DEFAULT 0
+            id          INTEGER PRIMARY KEY DEFAULT 1,
+            jackpot     INTEGER DEFAULT 0,
+            draw_at     INTEGER DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS lottery_tickets (
-            user_id BIGINT PRIMARY KEY,
-            tickets INT    DEFAULT 0
+            user_id INTEGER PRIMARY KEY,
+            tickets INTEGER DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS transfers (
-            id      BIGSERIAL PRIMARY KEY,
-            from_id BIGINT,
-            to_id   BIGINT,
-            amount  BIGINT,
-            fee     BIGINT,
-            ts      BIGINT DEFAULT 0
+            id      INTEGER PRIMARY KEY AUTOINCREMENT,
+            from_id INTEGER,
+            to_id   INTEGER,
+            amount  INTEGER,
+            fee     INTEGER,
+            ts      INTEGER DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS items (
-            id      SERIAL PRIMARY KEY,
+            id      INTEGER PRIMARY KEY AUTOINCREMENT,
             name    TEXT,
-            emoji   TEXT    DEFAULT '📦',
-            price   BIGINT,
-            supply  INT     DEFAULT -1,
-            sold    INT     DEFAULT 0,
-            active  SMALLINT DEFAULT 1
+            emoji   TEXT DEFAULT '📦',
+            desc    TEXT DEFAULT '',
+            price   INTEGER,
+            effect  TEXT DEFAULT '',
+            supply  INTEGER DEFAULT -1,
+            sold    INTEGER DEFAULT 0,
+            active  INTEGER DEFAULT 1
         );
         CREATE TABLE IF NOT EXISTS inventory (
-            user_id BIGINT,
-            item_id INT,
-            qty     INT DEFAULT 1,
+            user_id INTEGER,
+            item_id INTEGER,
+            qty     INTEGER DEFAULT 1,
             PRIMARY KEY (user_id, item_id)
         );
         CREATE TABLE IF NOT EXISTS clans (
-            id         SERIAL PRIMARY KEY,
-            name       TEXT UNIQUE,
-            tag        TEXT UNIQUE,
-            owner      BIGINT,
-            balance    BIGINT  DEFAULT 0,
-            level      INT     DEFAULT 1,
-            xp         BIGINT  DEFAULT 0,
-            created_at BIGINT  DEFAULT 0
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            name        TEXT UNIQUE,
+            tag         TEXT UNIQUE,
+            owner       INTEGER,
+            balance     INTEGER DEFAULT 0,
+            level       INTEGER DEFAULT 1,
+            xp          INTEGER DEFAULT 0,
+            created_at  INTEGER DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS clan_members (
-            user_id   BIGINT PRIMARY KEY,
-            clan_id   INT,
-            role      TEXT DEFAULT 'member',
-            joined_at BIGINT DEFAULT 0
+            user_id     INTEGER PRIMARY KEY,
+            clan_id     INTEGER,
+            role        TEXT DEFAULT 'member',
+            joined_at   INTEGER DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS bans (
-            user_id BIGINT PRIMARY KEY,
+            user_id INTEGER PRIMARY KEY,
             reason  TEXT,
-            by      BIGINT,
-            ts      BIGINT DEFAULT 0
+            by      INTEGER,
+            ts      INTEGER DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS promo_codes (
-            code     TEXT PRIMARY KEY,
-            reward   BIGINT,
-            max_uses INT    DEFAULT 1,
-            uses     INT    DEFAULT 0,
-            expires  BIGINT DEFAULT 0,
-            active   SMALLINT DEFAULT 1
+            code        TEXT PRIMARY KEY,
+            reward      INTEGER,
+            max_uses    INTEGER DEFAULT 1,
+            uses        INTEGER DEFAULT 0,
+            expires     INTEGER DEFAULT 0,
+            active      INTEGER DEFAULT 1
         );
         CREATE TABLE IF NOT EXISTS promo_uses (
-            user_id BIGINT,
+            user_id INTEGER,
             code    TEXT,
-            ts      BIGINT DEFAULT 0,
+            ts      INTEGER DEFAULT 0,
             PRIMARY KEY (user_id, code)
         );
         CREATE TABLE IF NOT EXISTS donate_packages (
-            key    TEXT PRIMARY KEY,
-            stars  INT,
-            amount BIGINT,
-            label  TEXT
+            key     TEXT PRIMARY KEY,
+            stars   INTEGER,
+            amount  INTEGER,
+            label   TEXT
+        );
+        CREATE TABLE IF NOT EXISTS events (
+            id      INTEGER PRIMARY KEY AUTOINCREMENT,
+            type    TEXT,
+            payload TEXT,
+            active  INTEGER DEFAULT 1,
+            created_at INTEGER DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS game_log (
+            id      INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            game    TEXT,
+            bet     INTEGER,
+            result  INTEGER,
+            ts      INTEGER DEFAULT 0
         );
 
-        INSERT INTO lottery (id, jackpot, draw_at) VALUES (1, 0, 0)
-            ON CONFLICT (id) DO NOTHING;
-        INSERT INTO stocks (ticker, price, prev_price, updated_at) VALUES ('ECO', 10000, 10000, 0)
-            ON CONFLICT (ticker) DO NOTHING;
-        INSERT INTO donate_packages VALUES
-            ('s1',   1,    10000, '⭐ 10 000'),
-            ('s5',   5,    60000, '⭐ 60 000'),
-            ('s15',  15,  250000, '🔥 250 000'),
-            ('s50',  50,  900000, '🔥 900 000'),
-            ('s150', 150, 3000000,'💎 3 000 000'),
-            ('s250', 250, 5500000,'💎 5 500 000')
-            ON CONFLICT (key) DO NOTHING;
+        INSERT OR IGNORE INTO lottery (id,jackpot,draw_at) VALUES (1,0,0);
+        INSERT OR IGNORE INTO stocks  (ticker,price,prev_price,updated_at)
+            VALUES ('ECO',10000,10000,0);
+        INSERT OR IGNORE INTO donate_packages VALUES
+            ('s1',   1,    15000,  '⭐ 15 000'),
+            ('s5',   5,    80000,  '⭐ 80 000'),
+            ('s15',  15,   300000, '🔥 300 000'),
+            ('s50',  50,  1100000, '🔥 1 100 000'),
+            ('s150', 150, 3500000, '💎 3 500 000'),
+            ('s250', 250, 6000000, '💎 6 000 000');
+
+        INSERT OR IGNORE INTO items (emoji,name,desc,price,effect) VALUES
+            ('🖥','GPU x1',    'Майнинг +200/час',  8_000,  'mine+200'),
+            ('🖥','GPU x3',    'Майнинг +600/час', 22_000,  'mine+600'),
+            ('⚡','Турбо',     'Клик x2 на 1 час',  5_000,  'click_boost_3600'),
+            ('🎰','VIP-слоты', 'Слоты x1.5 выигрыш',12_000, 'slots_vip'),
+            ('🛡','Страховка', 'Защита от краша x1', 3_000,  'crash_shield');
 
         CREATE INDEX IF NOT EXISTS ix_users_bal  ON users(balance DESC);
         CREATE INDEX IF NOT EXISTS ix_users_xp   ON users(xp DESC);
         CREATE INDEX IF NOT EXISTS ix_port_user  ON portfolios(user_id);
-        CREATE INDEX IF NOT EXISTS ix_hist_tick  ON stock_history(ticker, ts DESC);
+        CREATE INDEX IF NOT EXISTS ix_hist_tick  ON stock_history(ticker,ts DESC);
+        CREATE INDEX IF NOT EXISTS ix_gamelog    ON game_log(user_id,ts DESC);
         """)
     print("✅ БД инициализирована")
 
@@ -253,12 +334,11 @@ def init_db():
 
 _flood: dict[int, list] = {}
 _banned_flood: dict[int, float] = {}
-_flock = threading.Lock()
-FLOOD_N, FLOOD_W, FLOOD_BAN = 10, 5, 300
+_flood_lock = threading.Lock()
 
 def is_flooding(uid: int) -> bool:
     t = time.time()
-    with _flock:
+    with _flood_lock:
         if uid in _banned_flood:
             if t < _banned_flood[uid]:
                 return True
@@ -271,106 +351,43 @@ def is_flooding(uid: int) -> bool:
             return True
     return False
 
-
 # ══════════════════════════════════════════════
-# 4. БОТ + WEBHOOK
+# 4. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ══════════════════════════════════════════════
-
-bot = telebot.TeleBot(TOKEN, threaded=True, num_threads=6)
-app = Flask(__name__)
-
-@app.route(f"/{TOKEN}", methods=["POST"])
-def webhook():
-    if request.headers.get("content-type") == "application/json":
-        json_string = request.get_data().decode("utf-8")
-        update = telebot.types.Update.de_json(json_string)
-        # Флуд-фильтр
-        try:
-            uid = None
-            if update.message and update.message.from_user:
-                uid = update.message.from_user.id
-            elif update.callback_query and update.callback_query.from_user:
-                uid = update.callback_query.from_user.id
-            if uid and is_flooding(uid):
-                return "OK", 200
-        except Exception:
-            pass
-        bot.process_new_updates([update])
-        return "OK", 200
-    abort(403)
-
-@app.route("/", methods=["GET"])
-def health():
-    return "Bot is running", 200
-
-
-# ══════════════════════════════════════════════
-# 5. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
-# ══════════════════════════════════════════════
-
-def fmt(n: int) -> str:
-    if n >= 1_000_000:
-        return f"{n/1_000_000:.1f}M"
-    if n >= 1_000:
-        return f"{n:,}".replace(",", " ")
-    return str(n)
 
 def now() -> int:
     return int(time.time())
 
-def cd_str(seconds: int) -> str:
-    if seconds <= 0:
-        return "готово"
-    h, r = divmod(int(seconds), 3600)
+def fmt(n: int) -> str:
+    if abs(n) >= 1_000_000:
+        return f"{n/1_000_000:.1f}M"
+    if abs(n) >= 1_000:
+        return f"{n:,}".replace(",", " ")
+    return str(n)
+
+def cd_str(s: int) -> str:
+    if s <= 0: return "готово"
+    h, r = divmod(max(0, s), 3600)
     m, s = divmod(r, 60)
-    if h:
-        return f"{h}ч {m}м"
-    if m:
-        return f"{m}м {s}с"
+    if h: return f"{h}ч {m}м"
+    if m: return f"{m}м {s}с"
     return f"{s}с"
 
 def is_admin(uid: int) -> bool:
     return uid in ADMIN_IDS
 
-def is_banned(uid: int) -> bool:
-    with db() as c:
-        c.execute("SELECT 1 FROM bans WHERE user_id=%s", (uid,))
-        return bool(c.fetchone())
-
-def get_user(uid: int) -> dict | None:
-    with db() as c:
-        c.execute("SELECT * FROM users WHERE id=%s", (uid,))
-        row = c.fetchone()
-        return dict(row) if row else None
-
-def ensure_user(uid: int, name: str = "") -> dict:
-    with db() as c:
-        c.execute(
-            """INSERT INTO users (id, name, created_at) VALUES (%s, %s, %s)
-               ON CONFLICT (id) DO NOTHING""",
-            (uid, name, now())
-        )
-    return get_user(uid)
-
-def add_balance(uid: int, amount: int):
-    with db() as c:
-        c.execute(
-            """UPDATE users
-               SET balance = balance + %s,
-                   total_earned = total_earned + GREATEST(0, %s)
-               WHERE id = %s""",
-            (amount, amount, uid)
-        )
-
-def add_xp(uid: int, xp: int):
-    with db() as c:
-        c.execute("UPDATE users SET xp=xp+%s WHERE id=%s", (xp, uid))
-
 def user_level(xp: int) -> int:
-    return max(1, int(math.sqrt(xp / 100)) + 1)
+    return max(1, int(math.sqrt(xp / 150)) + 1)
 
 def level_xp(lvl: int) -> int:
-    return (lvl - 1) ** 2 * 100
+    return (lvl - 1) ** 2 * 150
+
+def xp_bar(xp: int, bars: int = 10) -> str:
+    lvl = user_level(xp)
+    lo  = level_xp(lvl)
+    hi  = level_xp(lvl + 1)
+    pct = min(bars, int((xp - lo) / max(1, hi - lo) * bars))
+    return "█" * pct + "░" * (bars - pct)
 
 def send_alert(text: str):
     if ALERT_CHAT:
@@ -379,17 +396,134 @@ def send_alert(text: str):
         except Exception:
             pass
 
-def is_group(msg) -> bool:
-    return msg.chat.type in ("group", "supergroup")
-
-def get_display_name(msg) -> str:
-    u = msg.from_user
-    if not u:
-        return "Игрок"
-    return u.first_name or u.username or str(u.id)
-
 def mention(uid: int, name: str) -> str:
     return f'<a href="tg://user?id={uid}">{name}</a>'
+
+
+# ── DB helpers ──
+
+def get_user(uid: int) -> dict | None:
+    with db() as c:
+        c.execute("SELECT * FROM users WHERE id=?", (uid,))
+        row = c.fetchone()
+        return dict(row) if row else None
+
+def ensure_user(uid: int, name: str = "") -> dict:
+    ref_code = f"R{uid}"
+    with db() as c:
+        c.execute(
+            "INSERT OR IGNORE INTO users (id,name,ref_code,created_at) VALUES (?,?,?,?)",
+            (uid, name, ref_code, now())
+        )
+    return get_user(uid)
+
+def add_balance(uid: int, amount: int):
+    with db() as c:
+        c.execute(
+            "UPDATE users SET balance=balance+?, total_earned=total_earned+MAX(0,?) WHERE id=?",
+            (amount, amount, uid)
+        )
+
+def add_xp(uid: int, xp: int):
+    with db() as c:
+        c.execute("UPDATE users SET xp=xp+? WHERE id=?", (xp, uid))
+
+def is_banned_db(uid: int) -> bool:
+    with db() as c:
+        c.execute("SELECT 1 FROM bans WHERE user_id=?", (uid,))
+        return bool(c.fetchone())
+
+def get_achievements(uid: int) -> set:
+    u = get_user(uid)
+    if not u: return set()
+    try:
+        return set(json.loads(u.get("achievements") or "[]"))
+    except Exception:
+        return set()
+
+def grant_achievement(uid: int, key: str):
+    achs = get_achievements(uid)
+    if key in achs: return False
+    achs.add(key)
+    with db() as c:
+        c.execute("UPDATE users SET achievements=? WHERE id=?", (json.dumps(list(achs)), uid))
+    if key in ACHIEVEMENTS:
+        name, _ = ACHIEVEMENTS[key]
+        try:
+            bot.send_message(uid, f"🏅 <b>Ачивка разблокирована!</b>\n{name}", parse_mode="HTML")
+        except Exception:
+            pass
+    return True
+
+def log_game(uid: int, game: str, bet: int, result: int):
+    with db() as c:
+        c.execute("INSERT INTO game_log (user_id,game,bet,result,ts) VALUES (?,?,?,?,?)",
+                  (uid, game, bet, result, now()))
+        c.execute("UPDATE users SET total_games=total_games+1 WHERE id=?", (uid,))
+
+def check_milestones(uid: int):
+    u = get_user(uid)
+    if not u: return
+    if u["balance"] >= 1_000_000:
+        grant_achievement(uid, "rich")
+    if u["total_games"] >= 100:
+        grant_achievement(uid, "gambler")
+    if u["total_works"] >= 30:
+        grant_achievement(uid, "worker")
+    if u["total_mines"] >= 50:
+        grant_achievement(uid, "miner")
+    if u["total_clicks"] >= 1:
+        grant_achievement(uid, "first_click")
+    if u["ref_count"] >= 5:
+        grant_achievement(uid, "social")
+    if u["daily_streak"] >= 7:
+        grant_achievement(uid, "streak_7")
+    if u["daily_streak"] >= 30:
+        grant_achievement(uid, "streak_30")
+
+def has_item(uid: int, item_name: str) -> int:
+    """Возвращает кол-во предметов по эффекту в инвентаре."""
+    with db() as c:
+        c.execute("""SELECT SUM(inv.qty) FROM inventory inv
+                     JOIN items it ON it.id=inv.item_id
+                     WHERE inv.user_id=? AND it.effect LIKE ?""", (uid, f"%{item_name}%"))
+        row = c.fetchone()
+        return int(row[0] or 0)
+
+def mine_power(uid: int) -> int:
+    """Вычисляет мощность майнинга с учётом GPU."""
+    base = MINE_BASE
+    with db() as c:
+        c.execute("""SELECT it.effect, inv.qty FROM inventory inv
+                     JOIN items it ON it.id=inv.item_id
+                     WHERE inv.user_id=? AND it.effect LIKE 'mine+%'""", (uid,))
+        for row in c.fetchall():
+            try:
+                bonus = int(row["effect"].split("+")[1])
+                base += bonus * row["qty"]
+            except Exception:
+                pass
+    return base
+
+
+# ══════════════════════════════════════════════
+# 5. БОТ
+# ══════════════════════════════════════════════
+
+bot = telebot.TeleBot(TOKEN, threaded=True, num_threads=8)
+
+_orig_pnm = bot.process_new_messages
+def _safe_pnm(msgs):
+    ok = []
+    for m in msgs:
+        try:
+            uid = m.from_user.id if m.from_user else None
+            if uid and is_flooding(uid): continue
+        except Exception:
+            pass
+        ok.append(m)
+    if ok: _orig_pnm(ok)
+bot.process_new_messages = _safe_pnm
 
 
 # ══════════════════════════════════════════════
@@ -397,38 +531,52 @@ def mention(uid: int, name: str) -> str:
 # ══════════════════════════════════════════════
 
 def kb(*rows) -> InlineKeyboardMarkup:
+    """
+    Короткий конструктор клавиатуры.
+    Каждый row — список tuples: (text, callback) или ("url", text, url).
+    """
     m = InlineKeyboardMarkup()
     for row in rows:
         btns = []
         for item in row:
-            if len(item) == 2:
-                btns.append(InlineKeyboardButton(item[0], callback_data=item[1]))
-            elif item[0] == "url":
+            if item[0] == "url":
                 btns.append(InlineKeyboardButton(item[1], url=item[2]))
+            else:
+                btns.append(InlineKeyboardButton(item[0], callback_data=item[1]))
         m.row(*btns)
     return m
 
-def main_menu(uid: int) -> tuple[str, InlineKeyboardMarkup]:
+def _edit(call, text: str, markup: InlineKeyboardMarkup):
+    uid = call.from_user.id
+    try:
+        bot.edit_message_text(text, uid, call.message.message_id,
+                              reply_markup=markup, parse_mode="HTML")
+    except Exception:
+        bot.send_message(uid, text, reply_markup=markup, parse_mode="HTML")
+    bot.answer_callback_query(call.id)
+
+
+def main_menu_msg(uid: int) -> tuple[str, InlineKeyboardMarkup]:
     u = get_user(uid)
     bal  = u["balance"] if u else 0
-    bank = u["bank"]    if u else 0
+    bank = u["bank"] if u else 0
     lvl  = user_level(u["xp"]) if u else 1
-    is_prem = u and u["premium_until"] > now()
-    prem_tag = " ⭐" if is_prem else ""
+    prem = u and u["premium_until"] > now()
+    star = " ⭐" if prem else ""
 
     text = (
-        f"<b>💼 Главное меню{prem_tag}</b>\n"
+        f"<b>💎 Главная{star}</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"💵 Кошелёк: <b>{fmt(bal)}</b>\n"
-        f"🏦 Банк: <b>{fmt(bank)}</b>\n"
-        f"⚡ Уровень: <b>{lvl}</b>\n"
+        f"👛 {fmt(bal)} {CUR}   🏦 {fmt(bank)}\n"
+        f"⚡ Уровень <b>{lvl}</b>\n"
     )
     buttons = kb(
-        [("💵 Баланс", "menu_balance"), ("📈 Биржа", "menu_stock")],
-        [("⚒️ Работа", "menu_work"),   ("🎰 Игры",  "menu_games")],
-        [("🏦 Банк",   "menu_bank"),   ("🛍️ Магазин","menu_shop")],
-        [("🏆 Топ",    "menu_top"),    ("🎁 Бонус", "menu_bonus")],
-        [("👤 Профиль","menu_profile"),("🏰 Клан",  "menu_clan")],
+        [("👛 Кошелёк", "menu_wallet"),   ("📈 Биржа",   "menu_stock")],
+        [("⚒️ Работа",  "menu_work"),     ("🎰 Игры",    "menu_games")],
+        [("🏦 Банк",    "menu_bank"),     ("🛍️ Магазин", "menu_shop")],
+        [("🏆 Топ",     "menu_top"),      ("🎁 Бонус",   "menu_bonus")],
+        [("👤 Профиль", "menu_profile"),  ("🏰 Клан",    "menu_clan")],
+        [("💎 Донат",   "menu_donate"),   ("❓ Помощь",  "menu_help")],
     )
     return text, buttons
 
@@ -441,9 +589,10 @@ def main_menu(uid: int) -> tuple[str, InlineKeyboardMarkup]:
 def cmd_start(msg):
     uid  = msg.from_user.id
     name = msg.from_user.first_name or "Игрок"
-    if is_banned(uid):
+    if is_banned_db(uid):
         bot.send_message(uid, "🚫 Вы заблокированы.")
         return
+
     ensure_user(uid, name)
 
     # Реферал
@@ -453,54 +602,49 @@ def cmd_start(msg):
         u = get_user(uid)
         if u and not u["ref_by"] and ref != str(uid):
             with db() as c:
-                c.execute("SELECT id FROM users WHERE ref_code=%s", (ref,))
+                c.execute("SELECT id FROM users WHERE ref_code=?", (ref,))
                 row = c.fetchone()
                 if row:
-                    ref_uid = row["id"]
-                    bonus = 2_000
+                    ruid = row["id"]
+                    bonus = 3_000
                     add_balance(uid, bonus)
-                    add_balance(ref_uid, bonus)
-                    c.execute("UPDATE users SET ref_by=%s WHERE id=%s", (ref_uid, uid))
+                    add_balance(ruid, bonus)
+                    c.execute("UPDATE users SET ref_by=? WHERE id=?", (ruid, uid))
+                    c.execute("UPDATE users SET ref_count=ref_count+1 WHERE id=?", (ruid,))
                     try:
-                        bot.send_message(ref_uid,
+                        bot.send_message(ruid,
                             f"🎉 По вашей ссылке пришёл новый игрок!\n"
-                            f"Вам начислено <b>{fmt(bonus)} {CURRENCY}</b>",
-                            parse_mode="HTML")
+                            f"+<b>{fmt(bonus)} {CUR}</b>", parse_mode="HTML")
                     except Exception:
                         pass
 
-    text, btns = main_menu(uid)
+    text, btns = main_menu_msg(uid)
     bot.send_message(uid, text, reply_markup=btns, parse_mode="HTML")
 
 
-@bot.message_handler(func=lambda m: m.text and m.text.lower() in ["меню", "/меню", "menu", "/menu", "назад", "🏠"])
+@bot.message_handler(func=lambda m: m.text and m.text.lower().strip() in
+    ["меню", "/меню", "menu", "/menu", "🏠", "назад"])
 def cmd_menu(msg):
     uid = msg.from_user.id
-    if is_banned(uid):
-        return
+    if is_banned_db(uid): return
     ensure_user(uid, msg.from_user.first_name or "")
-    text, btns = main_menu(uid)
+    text, btns = main_menu_msg(uid)
     bot.send_message(uid, text, reply_markup=btns, parse_mode="HTML")
 
 
 @bot.callback_query_handler(func=lambda c: c.data == "home")
 def cb_home(call):
     uid = call.from_user.id
-    text, btns = main_menu(uid)
-    try:
-        bot.edit_message_text(text, uid, call.message.message_id,
-                              reply_markup=btns, parse_mode="HTML")
-    except Exception:
-        bot.send_message(uid, text, reply_markup=btns, parse_mode="HTML")
-    bot.answer_callback_query(call.id)
+    text, btns = main_menu_msg(uid)
+    _edit(call, text, btns)
 
 
 # ══════════════════════════════════════════════
-# 8. БАЛАНС / ПРОФИЛЬ
+# 8. КОШЕЛЁК / ПРОФИЛЬ
 # ══════════════════════════════════════════════
 
-@bot.callback_query_handler(func=lambda c: c.data == "menu_balance")
-def cb_balance(call):
+@bot.callback_query_handler(func=lambda c: c.data == "menu_wallet")
+def cb_wallet(call):
     uid = call.from_user.id
     u = get_user(uid)
     if not u:
@@ -508,42 +652,32 @@ def cb_balance(call):
         return
 
     lvl = user_level(u["xp"])
-    next_lvl_xp = level_xp(lvl + 1)
-    cur_xp = u["xp"] - level_xp(lvl)
-    xp_range = max(1, next_lvl_xp - level_xp(lvl))
-    xp_bar_pct = min(10, int(cur_xp / xp_range * 10))
-    bar = "█" * xp_bar_pct + "░" * (10 - xp_bar_pct)
+    bar = xp_bar(u["xp"])
 
+    # Долг
     with db() as c:
-        c.execute("SELECT amount, due_at FROM loans WHERE user_id=%s", (uid,))
+        c.execute("SELECT amount, due_at FROM loans WHERE user_id=?", (uid,))
         loan = c.fetchone()
-
-    loan_text = ""
+    loan_str = ""
     if loan and loan["amount"] > 0:
         due = datetime.fromtimestamp(loan["due_at"]).strftime("%d.%m")
-        loan_text = f"\n💳 Кредит: <b>{fmt(loan['amount'])} {CURRENCY}</b> до {due}"
+        loan_str = f"\n⚠️ Долг: <b>{fmt(loan['amount'])}</b> до {due}"
 
     text = (
-        f"<b>💵 Баланс</b>\n"
+        f"<b>👛 Кошелёк</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"Кошелёк: <b>{fmt(u['balance'])} {CURRENCY}</b>\n"
-        f"Банк:    <b>{fmt(u['bank'])} {CURRENCY}</b>\n"
-        f"Всего заработано: {fmt(u['total_earned'])}\n"
-        f"——\n"
-        f"⚡ Уровень {lvl} [{bar}]\n"
-        f"XP: {fmt(u['xp'])} / {fmt(next_lvl_xp)}"
-        f"{loan_text}"
+        f"Наличные: <b>{fmt(u['balance'])} {CUR}</b>\n"
+        f"Банк:     <b>{fmt(u['bank'])} {CUR}</b>\n"
+        f"Заработано: {fmt(u['total_earned'])}\n"
+        f"{loan_str}\n"
+        f"⚡ Ур. {lvl}  [{bar}]\n"
+        f"XP: {fmt(u['xp'])}"
     )
     buttons = kb(
-        [("💸 Перевод", "action_transfer"), ("📜 История", "menu_transfers")],
-        [("🏠 Меню", "home")]
+        [("💸 Перевод", "act_transfer"), ("🔄 Обновить", "menu_wallet")],
+        [("📜 История", "act_tx_hist"),  ("🏠 Меню",      "home")],
     )
-    try:
-        bot.edit_message_text(text, uid, call.message.message_id,
-                              reply_markup=buttons, parse_mode="HTML")
-    except Exception:
-        bot.send_message(uid, text, reply_markup=buttons, parse_mode="HTML")
-    bot.answer_callback_query(call.id)
+    _edit(call, text, buttons)
 
 
 @bot.callback_query_handler(func=lambda c: c.data == "menu_profile")
@@ -554,1235 +688,1532 @@ def cb_profile(call):
         bot.answer_callback_query(call.id, "Используй /start")
         return
 
-    lvl = user_level(u["xp"])
-    prem_str = (
-        datetime.fromtimestamp(u["premium_until"]).strftime("%d.%m.%Y")
-        if u["premium_until"] > now() else "нет"
-    )
+    lvl  = user_level(u["xp"])
+    prem = u["premium_until"] > now()
+    prem_str = f"⭐ до {datetime.fromtimestamp(u['premium_until']).strftime('%d.%m.%y')}" if prem else "—"
 
     with db() as c:
-        c.execute("""SELECT cl.name FROM clan_members cm
-                     JOIN clans cl ON cl.id=cm.clan_id WHERE cm.user_id=%s""", (uid,))
-        clan_row = c.fetchone()
-        c.execute("SELECT SUM(shares) as s FROM portfolios WHERE user_id=%s", (uid,))
-        port_row = c.fetchone()
+        c.execute("SELECT cl.name, cm.role FROM clan_members cm "
+                  "JOIN clans cl ON cl.id=cm.clan_id WHERE cm.user_id=?", (uid,))
+        clan = c.fetchone()
 
-    clan_str = clan_row["name"] if clan_row else "нет"
-    shares = port_row["s"] if port_row and port_row["s"] else 0
-    ref_code = u["ref_code"] or "—"
+    clan_str = f"[{clan['name']}] {clan['role']}" if clan else "—"
+
+    achs = get_achievements(uid)
+    ach_str = " ".join(ACHIEVEMENTS[k][0].split()[0] for k in achs) if achs else "нет"
+
+    reg = datetime.fromtimestamp(u["created_at"]).strftime("%d.%m.%Y") if u["created_at"] else "?"
 
     text = (
         f"<b>👤 Профиль</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"Имя: <b>{u['name'] or 'Игрок'}</b>\n"
-        f"ID: <code>{uid}</code>\n"
-        f"Уровень: <b>{lvl}</b>  |  XP: {fmt(u['xp'])}\n"
-        f"Стрик: 🔥 {u['daily_streak']} дней\n"
+        f"<b>{u['name'] or 'Игрок'}</b>  <code>{uid}</code>\n"
+        f"Уровень: <b>{lvl}</b>  XP: {fmt(u['xp'])}\n"
+        f"🔥 Стрик: <b>{u['daily_streak']}</b> дней\n"
         f"Premium: {prem_str}\n"
         f"Клан: {clan_str}\n"
-        f"Акции: {shares} шт.\n"
-        f"Реф-код: <code>{ref_code}</code>"
+        f"Приглашено: {u['ref_count']} игроков\n"
+        f"Игр: {u['total_games']}  Работ: {u['total_works']}  Кликов: {u['total_clicks']}\n"
+        f"Рег: {reg}\n"
+        f"🏅 {ach_str}"
     )
     buttons = kb(
-        [("✏️ Сменить имя", "action_rename"), ("🏠 Меню", "home")]
+        [("✏️ Имя",         "act_rename"),  ("🏅 Ачивки",   "menu_achiev")],
+        [("🔗 Реферал",     "act_reflink"),  ("🏠 Меню",     "home")],
     )
-    try:
-        bot.edit_message_text(text, uid, call.message.message_id,
-                              reply_markup=buttons, parse_mode="HTML")
-    except Exception:
-        bot.send_message(uid, text, reply_markup=buttons, parse_mode="HTML")
-    bot.answer_callback_query(call.id)
+    _edit(call, text, buttons)
 
 
-# ══════════════════════════════════════════════
-# 9. КЛИКЕР
-# ══════════════════════════════════════════════
-
-@bot.message_handler(func=lambda m: m.text and m.text.strip() in ["клик", "/клик", "click"])
-def cmd_click(msg):
-    uid = msg.from_user.id
-    ensure_user(uid, msg.from_user.first_name or "")
-    u = get_user(uid)
-
-    remaining = CD_CLICK - (now() - u["last_click"])
-    if remaining > 0:
-        bot.send_message(uid, f"⏱ Подожди ещё <b>{cd_str(remaining)}</b>", parse_mode="HTML")
-        return
-
-    power = u["click_power"]
-    streak_bonus = 1.5 if u["daily_streak"] >= 7 else (1.2 if u["daily_streak"] >= 3 else 1.0)
-    earn = int(power * streak_bonus * random.uniform(0.8, 1.2))
-    add_balance(uid, earn)
-    add_xp(uid, 5)
-    with db() as c:
-        c.execute("UPDATE users SET last_click=%s WHERE id=%s", (now(), uid))
-
-    bot.send_message(uid,
-        f"⚡ Клик! +<b>{fmt(earn)} {CURRENCY}</b>\n"
-        f"{'🔥 Бонус стрика x'+str(streak_bonus) if streak_bonus > 1 else ''}",
-        reply_markup=kb([("⚡ Ещё раз", "action_click"), ("🏠 Меню", "home")]),
-        parse_mode="HTML")
-
-
-@bot.callback_query_handler(func=lambda c: c.data == "action_click")
-def cb_click(call):
+@bot.callback_query_handler(func=lambda c: c.data == "menu_achiev")
+def cb_achiev(call):
     uid = call.from_user.id
-    u = get_user(uid)
-    if not u:
-        bot.answer_callback_query(call.id, "Используй /start")
-        return
-    remaining = CD_CLICK - (now() - u["last_click"])
-    if remaining > 0:
-        bot.answer_callback_query(call.id, f"⏱ {cd_str(remaining)}", show_alert=False)
-        return
-    earn = int(u["click_power"] * random.uniform(0.8, 1.2))
-    add_balance(uid, earn)
-    add_xp(uid, 5)
-    with db() as c:
-        c.execute("UPDATE users SET last_click=%s WHERE id=%s", (now(), uid))
-    bot.answer_callback_query(call.id, f"⚡ +{fmt(earn)} {CURRENCY}", show_alert=False)
+    achs = get_achievements(uid)
+    lines = []
+    for key, (name, desc) in ACHIEVEMENTS.items():
+        done = "✅" if key in achs else "🔒"
+        lines.append(f"{done} <b>{name}</b> — {desc}")
+    text = "<b>🏅 Ачивки</b>\n━━━━━━━━━━━━━━━━━━\n" + "\n".join(lines)
+    _edit(call, text, kb([("◀️ Назад", "menu_profile"), ("🏠 Меню", "home")]))
 
 
 # ══════════════════════════════════════════════
-# 10. РАБОТА (4 ПРОФЕССИИ)
+# 9. ВВОД ТЕКСТА — FSM-словарь
 # ══════════════════════════════════════════════
 
-JOBS = {
-    "taxi":  {"name": "🚕 Такси",       "earn": (800,  1_600),  "xp": 20},
-    "cargo": {"name": "🚚 Курьер",      "earn": (1_200, 2_400), "xp": 30},
-    "trade": {"name": "📊 Трейдер",     "earn": (600,  3_000),  "xp": 25, "risk": True},
-    "code":  {"name": "💻 Программист", "earn": (2_000, 4_000), "xp": 40},
+_waiting: dict[int, str] = {}
+
+PROMPTS = {
+    "act_transfer":   "💸 Введи: @username сумма\nПример: @ivan 5000",
+    "act_rename":     "✏️ Введи новое имя (до 20 символов):",
+    "bank_deposit":   "🏦 Введи сумму для вклада:",
+    "bank_withdraw":  "🏦 Введи сумму для снятия:",
+    "bank_loan":      f"💳 Введи сумму кредита (макс {fmt(LOAN_MAX)}):",
+    "bank_repay":     "💳 Введи сумму для погашения:",
+    "term_deposit":   f"⏳ Введи сумму срочного вклада (lock 7 дней, +{TERM_RATE*100:.0f}%/сут):",
+    "term_withdraw":  "⏳ Введи сумму для снятия срочного вклада (штраф 50%):",
+    "stock_buy":      "📈 Введи количество акций для покупки:",
+    "stock_sell":     "📉 Введи количество акций для продажи:",
+    "game_dice":      "🎲 Введи ставку:",
+    "game_slots":     "🎰 Введи ставку:",
+    "game_roul":      "🎡 Введи: цвет сумма\nПример: красное 1000",
+    "game_crash":     "⚡ Введи ставку:",
+    "game_mines":     "💣 Введи ставку:",
+    "game_tower":     "🏯 Введи ставку:",
+    "clan_create":    "🏰 Введи: Название ТЕГ\nПример: Легион LEG\nСтоимость: 5 000",
+    "clan_donate":    f"💰 Введи сумму взноса в казну клана:",
+    "promo_use":      "🎁 Введи промокод:",
+    "act_tx_hist":    None,  # безвводный
 }
 
-@bot.callback_query_handler(func=lambda c: c.data == "menu_work")
-def cb_work_menu(call):
+@bot.callback_query_handler(func=lambda c: c.data in PROMPTS and PROMPTS[c.data] is not None)
+def cb_ask_input(call):
     uid = call.from_user.id
-    u = get_user(uid)
-    remaining = CD_WORK - (now() - u["last_work"]) if u else 0
+    action = call.data
 
-    if remaining > 0:
-        text    = f"<b>⚒️ Работа</b>\n\nДоступно через: <b>{cd_str(remaining)}</b>"
-        buttons = kb([("🏠 Меню", "home")])
+    # Спец-обработка stock_buy/sell — нужны доп. данные
+    if action == "stock_buy":
+        st = _get_stock()
+        u  = get_user(uid)
+        max_sh = u["balance"] // st["price"] if u else 0
+        extra = f"\nЦена: <b>{fmt(st['price'])}</b>  Можешь купить: <b>{max_sh}</b>"
+    elif action == "stock_sell":
+        with db() as c:
+            c.execute("SELECT shares FROM portfolios WHERE user_id=? AND ticker=?", (uid, TICKER))
+            port = c.fetchone()
+        extra = f"\nУ тебя: <b>{port['shares'] if port else 0}</b> акций"
     else:
-        text = "<b>⚒️ Выбери профессию:</b>"
-        rows = [[(f"{v['name']}  {fmt(v['earn'][0])}–{fmt(v['earn'][1])}", f"do_work_{k}")]
-                for k, v in JOBS.items()]
-        rows.append([("🏠 Меню", "home")])
-        buttons = kb(*rows)
+        extra = ""
 
-    try:
-        bot.edit_message_text(text, uid, call.message.message_id,
-                              reply_markup=buttons, parse_mode="HTML")
-    except Exception:
-        bot.send_message(uid, text, reply_markup=buttons, parse_mode="HTML")
+    _waiting[uid] = action
     bot.answer_callback_query(call.id)
-
-
-@bot.callback_query_handler(func=lambda c: c.data.startswith("do_work_"))
-def cb_do_work(call):
-    uid     = call.from_user.id
-    job_key = call.data[8:]
-    job     = JOBS.get(job_key)
-    if not job:
-        bot.answer_callback_query(call.id)
-        return
-
-    u = get_user(uid)
-    remaining = CD_WORK - (now() - u["last_work"])
-    if remaining > 0:
-        bot.answer_callback_query(call.id, f"⏱ {cd_str(remaining)}", show_alert=True)
-        return
-
-    lo, hi = job["earn"]
-    earn = random.randint(lo, hi)
-    if job.get("risk") and random.random() < 0.3:
-        earn = -random.randint(lo // 2, hi // 2)
-
-    add_balance(uid, earn)
-    add_xp(uid, job["xp"])
-    with db() as c:
-        c.execute("UPDATE users SET last_work=%s WHERE id=%s", (now(), uid))
-
-    sign = "+" if earn >= 0 else ""
-    text = (
-        f"<b>{job['name']}</b>\n"
-        f"{'✅' if earn >= 0 else '📉'} Результат: <b>{sign}{fmt(earn)} {CURRENCY}</b>\n"
-        f"⭐ +{job['xp']} XP\n\n"
-        f"⏱ Следующая работа через <b>{cd_str(CD_WORK)}</b>"
-    )
-    buttons = kb([("⚒️ Работа", "menu_work"), ("🏠 Меню", "home")])
-    try:
-        bot.edit_message_text(text, uid, call.message.message_id,
-                              reply_markup=buttons, parse_mode="HTML")
-    except Exception:
-        bot.send_message(uid, text, reply_markup=buttons, parse_mode="HTML")
-    bot.answer_callback_query(call.id)
-
-
-# ══════════════════════════════════════════════
-# 11. МАЙНИНГ
-# ══════════════════════════════════════════════
-
-@bot.message_handler(func=lambda m: m.text and m.text.lower() in ["майнинг", "/майнинг", "mine"])
-def cmd_mine(msg):
-    uid = msg.from_user.id
-    ensure_user(uid, msg.from_user.first_name or "")
-    u = get_user(uid)
-
-    remaining = CD_MINE - (now() - u["last_mine"])
-    if remaining > 0:
-        bot.send_message(uid,
-            f"<b>⛏️ Майнинг</b>\n\n⏱ Следующий сбор через: <b>{cd_str(remaining)}</b>",
-            parse_mode="HTML")
-        return
-
-    with db() as c:
-        c.execute("SELECT qty FROM inventory WHERE user_id=%s AND item_id=1", (uid,))
-        row = c.fetchone()
-    cards = row["qty"] if row else 0
-
-    earn = int((MINE_BASE + cards * 200) * random.uniform(0.9, 1.1))
-    add_balance(uid, earn)
-    add_xp(uid, 10)
-    with db() as c:
-        c.execute("UPDATE users SET last_mine=%s WHERE id=%s", (now(), uid))
-
     bot.send_message(uid,
-        f"<b>⛏️ Майнинг</b>\n\n"
-        f"💰 Намайнено: <b>+{fmt(earn)} {CURRENCY}</b>\n"
-        f"🖥 Видеокарт: {cards}\n"
-        f"⏱ Следующий сбор через <b>{cd_str(CD_MINE)}</b>",
+        PROMPTS[action] + extra,
         parse_mode="HTML",
-        reply_markup=kb([("⛏️ Ещё раз", "mine_again"), ("🏠 Меню", "home")])
-    )
+        reply_markup=kb([("❌ Отмена", "cancel_input")]))
 
 
-@bot.callback_query_handler(func=lambda c: c.data == "mine_again")
-def cb_mine_again(call):
+@bot.callback_query_handler(func=lambda c: c.data == "cancel_input")
+def cb_cancel(call):
     uid = call.from_user.id
-    u = get_user(uid)
-    remaining = CD_MINE - (now() - u["last_mine"])
-    if remaining > 0:
-        bot.answer_callback_query(call.id, f"⏱ {cd_str(remaining)}", show_alert=False)
-    else:
-        bot.answer_callback_query(call.id)
-        cmd_mine(call.message)
+    _waiting.pop(uid, None)
+    bot.answer_callback_query(call.id, "Отменено")
+    text, btns = main_menu_msg(uid)
+    bot.send_message(uid, text, reply_markup=btns, parse_mode="HTML")
+
+
+@bot.message_handler(func=lambda m: m.from_user and m.from_user.id in _waiting
+                                    and m.chat.type == "private")
+def handle_input(msg):
+    uid    = msg.from_user.id
+    action = _waiting.pop(uid, None)
+    if not action: return
+    text   = msg.text.strip() if msg.text else ""
+    u      = get_user(uid)
+
+    home_btn = kb([("🏠 Меню", "home")])
+
+    # ── Rename ──
+    if action == "act_rename":
+        name = text[:20]
+        with db() as c:
+            c.execute("UPDATE users SET name=? WHERE id=?", (name, uid))
+        bot.send_message(uid, f"✅ Имя изменено на <b>{name}</b>",
+                         parse_mode="HTML", reply_markup=home_btn)
+        return
+
+    # ── Transfer ──
+    if action == "act_transfer":
+        parts = text.split()
+        if len(parts) < 2:
+            bot.send_message(uid, "❌ Формат: @username сумма"); return
+        uname = parts[0].lstrip("@")
+        try: amount = int(parts[1].replace(" ", ""))
+        except ValueError:
+            bot.send_message(uid, "❌ Неверная сумма"); return
+        if amount <= 0:
+            bot.send_message(uid, "❌ Сумма > 0"); return
+        fee   = int(amount * TRANSFER_FEE)
+        total = amount + fee
+        if u["balance"] < total:
+            bot.send_message(uid, f"❌ Нужно {fmt(total)} (комиссия {fmt(fee)})"); return
+        with db() as c:
+            c.execute("SELECT id,name FROM users WHERE name LIKE ? OR id=?",
+                      (f"%{uname}%", 0))
+            c.execute("SELECT id,name FROM users WHERE name LIKE ?", (f"%{uname}%",))
+            row = c.fetchone()
+        if not row:
+            bot.send_message(uid, "❌ Игрок не найден"); return
+        to_uid = row["id"]
+        if to_uid == uid:
+            bot.send_message(uid, "❌ Нельзя себе"); return
+        add_balance(uid,   -total)
+        add_balance(to_uid, amount)
+        with db() as c:
+            c.execute("INSERT INTO transfers (from_id,to_id,amount,fee,ts) VALUES (?,?,?,?,?)",
+                      (uid, to_uid, amount, fee, now()))
+        try:
+            bot.send_message(to_uid,
+                f"💸 Вам перевели <b>{fmt(amount)} {CUR}</b>",
+                parse_mode="HTML")
+        except Exception: pass
+        bot.send_message(uid,
+            f"✅ Переведено <b>{fmt(amount)}</b> + комиссия <b>{fmt(fee)}</b>",
+            parse_mode="HTML", reply_markup=home_btn)
+        return
+
+    # ── Bank ops ──
+    if action in ("bank_deposit", "bank_withdraw", "bank_loan", "bank_repay",
+                  "term_deposit", "term_withdraw"):
+        try: amount = int(text.replace(" ", "").replace(",", ""))
+        except ValueError:
+            bot.send_message(uid, "❌ Введи число"); return
+        if amount <= 0:
+            bot.send_message(uid, "❌ > 0"); return
+        _do_bank_op(uid, action, amount)
+        return
+
+    # ── Stock ──
+    if action in ("stock_buy", "stock_sell"):
+        try: qty = int(text)
+        except ValueError:
+            bot.send_message(uid, "❌ Введи число"); return
+        if qty <= 0:
+            bot.send_message(uid, "❌ > 0"); return
+        _do_stock_op(uid, action, qty)
+        return
+
+    # ── Games ──
+    game_map = {
+        "game_dice":  _game_dice,
+        "game_slots": _game_slots,
+        "game_crash": _game_crash_start,
+        "game_mines": _game_mines_start,
+        "game_tower": _game_tower_start,
+    }
+    if action in game_map:
+        try: bet = int(text.replace(" ", ""))
+        except ValueError:
+            bot.send_message(uid, "❌ Введи ставку"); return
+        if bet <= 0:
+            bot.send_message(uid, "❌ > 0"); return
+        if u["balance"] < bet:
+            bot.send_message(uid, f"❌ Баланс: {fmt(u['balance'])}"); return
+        game_map[action](uid, bet)
+        return
+
+    if action == "game_roul":
+        parts = text.lower().split()
+        if len(parts) < 2:
+            bot.send_message(uid, "❌ Формат: красное 1000"); return
+        try: bet = int(parts[1])
+        except ValueError:
+            bot.send_message(uid, "❌ Неверная ставка"); return
+        if u["balance"] < bet:
+            bot.send_message(uid, f"❌ Баланс: {fmt(u['balance'])}"); return
+        _game_roulette(uid, parts[0], bet)
+        return
+
+    # ── Clan ──
+    if action == "clan_create":
+        _do_clan_create(uid, text)
+        return
+    if action == "clan_donate":
+        try: amount = int(text.replace(" ", ""))
+        except ValueError:
+            bot.send_message(uid, "❌ Введи число"); return
+        _do_clan_donate(uid, amount)
+        return
+
+    # ── Promo ──
+    if action == "promo_use":
+        _use_promo(uid, text.upper())
+        return
 
 
 # ══════════════════════════════════════════════
-# 12. ЕЖЕДНЕВНЫЙ БОНУС
+# 10. ЕЖЕДНЕВНЫЙ БОНУС
 # ══════════════════════════════════════════════
 
 @bot.callback_query_handler(func=lambda c: c.data == "menu_bonus")
 def cb_bonus(call):
     uid = call.from_user.id
-    u = get_user(uid)
-    if not u:
-        bot.answer_callback_query(call.id, "Используй /start")
+    u   = get_user(uid)
+    rem = CD_DAILY - (now() - u["last_daily"])
+
+    if rem > 0:
+        text = (
+            f"<b>🎁 Ежедневный бонус</b>\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"⏱ Через: <b>{cd_str(rem)}</b>\n"
+            f"🔥 Стрик: <b>{u['daily_streak']}</b> дней"
+        )
+        _edit(call, text, kb([("🎁 Промокод", "promo_use"), ("🏠 Меню", "home")]))
         return
 
-    remaining = CD_DAILY - (now() - u["last_daily"])
+    streak = u["daily_streak"]
+    bonus  = 1_500 + streak * 150
+    if u.get("premium_until", 0) > now():
+        bonus = int(bonus * 1.5)
 
-    if remaining > 0:
-        text = (
-            f"<b>🎁 Ежедневный бонус</b>\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"⏱ Следующий бонус через: <b>{cd_str(remaining)}</b>\n"
-            f"🔥 Стрик: <b>{u['daily_streak']} дней</b>"
-        )
-        buttons = kb([("🏠 Меню", "home")])
-    else:
-        streak = u["daily_streak"]
-        bonus  = 1_000 + streak * 100
-        text = (
-            f"<b>🎁 Ежедневный бонус</b>\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"🔥 Стрик: <b>{streak} дней</b>\n"
-            f"💰 Получишь: <b>+{fmt(bonus)} {CURRENCY}</b>"
-        )
-        buttons = kb([("✅ Получить", "claim_bonus"), ("🏠 Меню", "home")])
-
-    try:
-        bot.edit_message_text(text, uid, call.message.message_id,
-                              reply_markup=buttons, parse_mode="HTML")
-    except Exception:
-        bot.send_message(uid, text, reply_markup=buttons, parse_mode="HTML")
-    bot.answer_callback_query(call.id)
+    text = (
+        f"<b>🎁 Ежедневный бонус</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🔥 Стрик: <b>{streak}</b> дней\n"
+        f"💰 Получишь: <b>+{fmt(bonus)} {CUR}</b>"
+        + (" ⭐×1.5" if u.get("premium_until", 0) > now() else "")
+    )
+    _edit(call, text, kb([("✅ Получить", "claim_bonus"), ("🏠 Меню", "home")]))
 
 
 @bot.callback_query_handler(func=lambda c: c.data == "claim_bonus")
 def cb_claim_bonus(call):
     uid = call.from_user.id
-    u = get_user(uid)
-    remaining = CD_DAILY - (now() - u["last_daily"])
-    if remaining > 0:
-        bot.answer_callback_query(call.id, f"⏱ {cd_str(remaining)}", show_alert=True)
+    u   = get_user(uid)
+    rem = CD_DAILY - (now() - u["last_daily"])
+    if rem > 0:
+        bot.answer_callback_query(call.id, f"⏱ {cd_str(rem)}", show_alert=True)
         return
 
-    # Стрик: даём 1ч форы
-    is_consecutive = (now() - u["last_daily"]) < CD_DAILY + 3600
-    streak = (u["daily_streak"] + 1) if is_consecutive else 1
-    bonus  = 1_000 + streak * 100
+    consec  = (now() - u["last_daily"]) < CD_DAILY + 7200
+    streak  = (u["daily_streak"] + 1) if consec else 1
+    bonus   = 1_500 + streak * 150
+    if u.get("premium_until", 0) > now():
+        bonus = int(bonus * 1.5)
 
     add_balance(uid, bonus)
-    add_xp(uid, 20)
+    add_xp(uid, 30)
     with db() as c:
-        c.execute("UPDATE users SET last_daily=%s, daily_streak=%s WHERE id=%s",
+        c.execute("UPDATE users SET last_daily=?, daily_streak=? WHERE id=?",
                   (now(), streak, uid))
+    check_milestones(uid)
 
     text = (
-        f"<b>🎁 Бонус получен!</b>\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"+<b>{fmt(bonus)} {CURRENCY}</b>\n"
-        f"🔥 Стрик: <b>{streak} дней</b>"
+        f"<b>🎁 Получено!</b>\n"
+        f"+<b>{fmt(bonus)} {CUR}</b>\n"
+        f"🔥 Стрик: <b>{streak}</b> дней"
     )
-    try:
-        bot.edit_message_text(text, uid, call.message.message_id,
-                              reply_markup=kb([("🏠 Меню", "home")]), parse_mode="HTML")
-    except Exception:
-        bot.send_message(uid, text, reply_markup=kb([("🏠 Меню", "home")]), parse_mode="HTML")
+    _edit(call, text, kb([("🎁 Промокод", "promo_use"), ("🏠 Меню", "home")]))
     bot.answer_callback_query(call.id, "✅ Получено!")
 
 
+@bot.callback_query_handler(func=lambda c: c.data == "promo_use")
+def cb_promo_menu(call):
+    uid = call.from_user.id
+    _waiting[uid] = "promo_use"
+    bot.answer_callback_query(call.id)
+    bot.send_message(uid, "🎁 Введи промокод:",
+                     reply_markup=kb([("❌ Отмена", "cancel_input")]))
+
+
+def _use_promo(uid: int, code: str):
+    with db() as c:
+        c.execute("SELECT * FROM promo_codes WHERE code=? AND active=1", (code,))
+        promo = c.fetchone()
+    home_btn = kb([("🏠 Меню", "home")])
+    if not promo:
+        bot.send_message(uid, "❌ Промокод не найден", reply_markup=home_btn); return
+    if promo["expires"] and promo["expires"] < now():
+        bot.send_message(uid, "❌ Истёк", reply_markup=home_btn); return
+    if promo["max_uses"] > 0 and promo["uses"] >= promo["max_uses"]:
+        bot.send_message(uid, "❌ Исчерпан", reply_markup=home_btn); return
+    with db() as c:
+        try:
+            c.execute("INSERT INTO promo_uses (user_id,code,ts) VALUES (?,?,?)",
+                      (uid, code, now()))
+        except Exception:
+            bot.send_message(uid, "❌ Уже использован", reply_markup=home_btn); return
+        c.execute("UPDATE promo_codes SET uses=uses+1 WHERE code=?", (code,))
+    add_balance(uid, promo["reward"])
+    bot.send_message(uid,
+        f"✅ <b>Промокод активирован!</b>\n+{fmt(promo['reward'])} {CUR}",
+        parse_mode="HTML", reply_markup=home_btn)
+
+
 # ══════════════════════════════════════════════
-# 13. БАНК — ВКЛАД / КРЕДИТ
+# 11. КЛИКЕР
+# ══════════════════════════════════════════════
+
+@bot.message_handler(func=lambda m: m.text and m.text.lower().strip()
+                     in ["клик", "/клик", "click", "/click", "⚡"])
+def cmd_click(msg):
+    uid = msg.from_user.id
+    ensure_user(uid, msg.from_user.first_name or "")
+    u = get_user(uid)
+
+    rem = CD_CLICK - (now() - u["last_click"])
+    if rem > 0:
+        bot.send_message(uid, f"⏱ <b>{cd_str(rem)}</b>", parse_mode="HTML")
+        return
+
+    power = u["click_power"]
+    # Стрик бонус
+    sb = 1.0
+    if u["daily_streak"] >= 30: sb = 2.0
+    elif u["daily_streak"] >= 7: sb = 1.5
+    elif u["daily_streak"] >= 3: sb = 1.2
+    # Premium бонус
+    if u.get("premium_until", 0) > now(): sb *= 1.3
+
+    earn = int(power * sb * random.uniform(0.85, 1.15))
+    add_balance(uid, earn)
+    add_xp(uid, 3)
+    with db() as c:
+        c.execute("UPDATE users SET last_click=?, total_clicks=total_clicks+1 WHERE id=?",
+                  (now(), uid))
+    check_milestones(uid)
+
+    sb_str = f" 🔥×{sb:.1f}" if sb > 1 else ""
+    bot.send_message(uid,
+        f"⚡ +<b>{fmt(earn)} {CUR}</b>{sb_str}",
+        parse_mode="HTML",
+        reply_markup=kb([("⚡ Ещё", "act_click"), ("🏠 Меню", "home")]))
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "act_click")
+def cb_click(call):
+    uid = call.from_user.id
+    u = get_user(uid)
+    if not u:
+        bot.answer_callback_query(call.id, "Используй /start"); return
+    rem = CD_CLICK - (now() - u["last_click"])
+    if rem > 0:
+        bot.answer_callback_query(call.id, f"⏱ {cd_str(rem)}", show_alert=False); return
+    earn = int(u["click_power"] * random.uniform(0.85, 1.15))
+    add_balance(uid, earn)
+    add_xp(uid, 3)
+    with db() as c:
+        c.execute("UPDATE users SET last_click=?, total_clicks=total_clicks+1 WHERE id=?",
+                  (now(), uid))
+    bot.answer_callback_query(call.id, f"⚡ +{fmt(earn)} {CUR}")
+
+
+# ══════════════════════════════════════════════
+# 12. РАБОТА
+# ══════════════════════════════════════════════
+
+JOBS = {
+    "taxi":    {"name": "🚕 Такси",       "earn": (1_000, 2_000), "xp": 25},
+    "cargo":   {"name": "🚚 Курьер",      "earn": (1_500, 3_000), "xp": 35},
+    "trade":   {"name": "📊 Трейдер",     "earn": (800,  4_000),  "xp": 30, "risk": True},
+    "code":    {"name": "💻 Программист", "earn": (2_500, 5_000), "xp": 50},
+    "streamer":{"name": "🎮 Стример",     "earn": (500,  6_000),  "xp": 40, "wildcard": True},
+}
+
+WORK_EVENTS = [
+    "🎊 Удачный день! Бонус x1.5!",
+    "💼 Обычная смена.",
+    "🌧 Плохой день, -30% доход.",
+    "🎁 Клиент дал чаевые! +500",
+    "🚨 Штраф инспекции. -300",
+]
+
+@bot.callback_query_handler(func=lambda c: c.data == "menu_work")
+def cb_work_menu(call):
+    uid = call.from_user.id
+    u = get_user(uid)
+    rem = CD_WORK - (now() - u["last_work"])
+
+    if rem > 0:
+        text = f"<b>⚒️ Работа</b>\n\n⏱ Доступна через: <b>{cd_str(rem)}</b>"
+        _edit(call, text, kb([("🏠 Меню", "home")]))
+        return
+
+    lines = []
+    for k, v in JOBS.items():
+        lo, hi = v["earn"]
+        tag = " 🎲" if v.get("wildcard") else (" ⚠️" if v.get("risk") else "")
+        lines.append(f"{v['name']}{tag}  {fmt(lo)}–{fmt(hi)}")
+
+    text = "<b>⚒️ Выбери профессию:</b>\n━━━━━━━━━━━━━━━━━━\n" + "\n".join(lines)
+    rows = [[(f"{v['name']}", f"do_work_{k}")] for k, v in JOBS.items()]
+    rows.append([("🏠 Меню", "home")])
+    _edit(call, text, kb(*rows))
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("do_work_"))
+def cb_do_work(call):
+    uid = call.from_user.id
+    key = call.data[8:]
+    job = JOBS.get(key)
+    if not job:
+        bot.answer_callback_query(call.id); return
+
+    u = get_user(uid)
+    rem = CD_WORK - (now() - u["last_work"])
+    if rem > 0:
+        bot.answer_callback_query(call.id, f"⏱ {cd_str(rem)}", show_alert=True); return
+
+    lo, hi = job["earn"]
+    earn = random.randint(lo, hi)
+
+    # Wildcard — огромный разброс
+    if job.get("wildcard"):
+        earn = random.choice([random.randint(100, 1_000), random.randint(5_000, 10_000)])
+
+    # Risk — потеря 30%
+    event_text = ""
+    if job.get("risk") and random.random() < 0.25:
+        earn = -random.randint(lo // 3, hi // 3)
+    else:
+        ev_idx = random.randint(0, len(WORK_EVENTS) - 1)
+        event = WORK_EVENTS[ev_idx]
+        if "x1.5" in event:
+            earn = int(earn * 1.5)
+        elif "-30%" in event:
+            earn = int(earn * 0.7)
+        elif "+500" in event:
+            earn += 500
+        elif "-300" in event:
+            earn -= 300
+        event_text = f"\n<i>{event}</i>"
+
+    add_balance(uid, earn)
+    add_xp(uid, job["xp"])
+    with db() as c:
+        c.execute("UPDATE users SET last_work=?, total_works=total_works+1 WHERE id=?",
+                  (now(), uid))
+    check_milestones(uid)
+
+    sign = "+" if earn >= 0 else ""
+    icon = "✅" if earn >= 0 else "📉"
+    text = (
+        f"<b>{job['name']}</b>\n"
+        f"{icon} <b>{sign}{fmt(earn)} {CUR}</b>{event_text}\n"
+        f"⭐ +{job['xp']} XP\n"
+        f"⏱ Следующая через <b>{cd_str(CD_WORK)}</b>"
+    )
+    _edit(call, text, kb([("⚒️ Работа", "menu_work"), ("🏠 Меню", "home")]))
+
+
+# ══════════════════════════════════════════════
+# 13. МАЙНИНГ
+# ══════════════════════════════════════════════
+
+@bot.message_handler(func=lambda m: m.text and m.text.lower().strip()
+                     in ["майнинг", "/майнинг", "mine", "⛏"])
+def cmd_mine(msg):
+    uid = msg.from_user.id
+    ensure_user(uid, msg.from_user.first_name or "")
+    u = get_user(uid)
+
+    rem = CD_MINE - (now() - u["last_mine"])
+    if rem > 0:
+        bot.send_message(uid,
+            f"<b>⛏️ Майнинг</b>\n\n⏱ Сбор через: <b>{cd_str(rem)}</b>",
+            parse_mode="HTML")
+        return
+
+    power = mine_power(uid)
+    earn  = int(power * random.uniform(0.9, 1.1))
+    add_balance(uid, earn)
+    add_xp(uid, 15)
+    with db() as c:
+        c.execute("UPDATE users SET last_mine=?, total_mines=total_mines+1 WHERE id=?",
+                  (now(), uid))
+    check_milestones(uid)
+
+    # GPU кол-во
+    with db() as c:
+        c.execute("""SELECT SUM(inv.qty) FROM inventory inv
+                     JOIN items it ON it.id=inv.item_id
+                     WHERE inv.user_id=? AND it.effect LIKE 'mine+%'""", (uid,))
+        gpus = int(c.fetchone()[0] or 0)
+
+    bot.send_message(uid,
+        f"<b>⛏️ Майнинг</b>\n\n"
+        f"💰 +<b>{fmt(earn)} {CUR}</b>\n"
+        f"🖥 GPU: {gpus}  Мощность: {power}/час\n"
+        f"⏱ Сбор через <b>{cd_str(CD_MINE)}</b>",
+        parse_mode="HTML",
+        reply_markup=kb([("⛏️ Ещё раз", "act_mine"), ("🏠 Меню", "home")]))
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "act_mine")
+def cb_mine(call):
+    uid = call.from_user.id
+    u = get_user(uid)
+    rem = CD_MINE - (now() - u["last_mine"])
+    if rem > 0:
+        bot.answer_callback_query(call.id, f"⏱ {cd_str(rem)}"); return
+    cmd_mine(call.message)
+    call.message.from_user = call.from_user
+    bot.answer_callback_query(call.id)
+
+
+# ══════════════════════════════════════════════
+# 14. БАНК
 # ══════════════════════════════════════════════
 
 @bot.callback_query_handler(func=lambda c: c.data == "menu_bank")
 def cb_bank(call):
     uid = call.from_user.id
-    u = get_user(uid)
+    u   = get_user(uid)
 
     # Начисляем проценты
-    if u and u["bank"] > 0:
-        days = (now() - (u.get("last_interest_calc") or now())) / 86400
+    if u["bank"] > 0 and u["last_interest"] > 0:
+        days = (now() - u["last_interest"]) / 86400
         if days >= 1:
             interest = int(u["bank"] * BANK_RATE * days)
             with db() as c:
-                c.execute("UPDATE users SET bank=bank+%s, last_interest_calc=%s WHERE id=%s",
+                c.execute("UPDATE users SET bank=bank+?, last_interest=? WHERE id=?",
                           (interest, now(), uid))
             u = get_user(uid)
+    elif u["bank"] > 0 and u["last_interest"] == 0:
+        with db() as c:
+            c.execute("UPDATE users SET last_interest=? WHERE id=?", (now(), uid))
 
+    # Срочный вклад
     with db() as c:
-        c.execute("SELECT amount, due_at FROM loans WHERE user_id=%s", (uid,))
+        c.execute("SELECT * FROM term_deposits WHERE user_id=?", (uid,))
+        term = c.fetchone()
+
+    # Кредит
+    with db() as c:
+        c.execute("SELECT amount, due_at FROM loans WHERE user_id=?", (uid,))
         loan = c.fetchone()
 
     loan_str = "нет"
     if loan and loan["amount"] > 0:
         due = datetime.fromtimestamp(loan["due_at"]).strftime("%d.%m")
-        loan_str = f"{fmt(loan['amount'])} {CURRENCY} до {due}"
+        loan_str = f"{fmt(loan['amount'])} до {due}"
+
+    term_str = "нет"
+    if term and term["amount"] > 0:
+        locked = term["locked_until"] > now()
+        unlock = datetime.fromtimestamp(term["locked_until"]).strftime("%d.%m")
+        term_str = f"{fmt(term['amount'])} (до {unlock}{'🔒' if locked else '✅'})"
 
     text = (
         f"<b>🏦 Банк</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"На счёте: <b>{fmt(u['bank'])} {CURRENCY}</b>\n"
-        f"💹 Ставка: <b>{BANK_RATE*100:.0f}%</b>/сутки\n"
+        f"Вклад: <b>{fmt(u['bank'])} {CUR}</b>  {BANK_RATE*100:.0f}%/сут\n"
+        f"Срочный: {term_str}  {TERM_RATE*100:.0f}%/сут\n"
         f"——\n"
-        f"Кредит: <b>{loan_str}</b>\n"
-        f"Максимум займа: <b>{fmt(LOAN_MAX)}</b>"
+        f"Кредит: {loan_str}\n"
+        f"Макс. займ: {fmt(LOAN_MAX)}"
     )
     buttons = kb(
-        [("📥 Внести", "bank_deposit"), ("📤 Снять", "bank_withdraw")],
-        [("💳 Кредит",  "bank_loan"),   ("💰 Погасить", "bank_repay")],
-        [("🏠 Меню", "home")]
+        [("📥 Внести",   "bank_deposit"),  ("📤 Снять",    "bank_withdraw")],
+        [("⏳ Срочный",  "term_deposit"),   ("⏳ Забрать",  "term_withdraw")],
+        [("💳 Кредит",  "bank_loan"),      ("💰 Погасить", "bank_repay")],
+        [("🏠 Меню",    "home")],
     )
-    try:
-        bot.edit_message_text(text, uid, call.message.message_id,
-                              reply_markup=buttons, parse_mode="HTML")
-    except Exception:
-        bot.send_message(uid, text, reply_markup=buttons, parse_mode="HTML")
-    bot.answer_callback_query(call.id)
+    _edit(call, text, buttons)
 
 
-# ── Ввод суммы через следующее сообщение ──────
-
-_waiting: dict[int, str] = {}
-
-@bot.callback_query_handler(func=lambda c: c.data in [
-    "bank_deposit","bank_withdraw","bank_loan","bank_repay","action_transfer","action_rename"
-])
-def cb_input_prompt(call):
-    uid = call.from_user.id
-    _waiting[uid] = call.data
-    prompts = {
-        "bank_deposit":   "Введи сумму для вклада:",
-        "bank_withdraw":  "Введи сумму для снятия:",
-        "bank_loan":      f"Введи сумму кредита (макс {fmt(LOAN_MAX)}):",
-        "bank_repay":     "Введи сумму для погашения:",
-        "action_transfer":"Введи: @username сумма\nПример: @ivan 5000",
-        "action_rename":  "Введи новое имя (до 20 символов):",
-    }
-    bot.answer_callback_query(call.id)
-    bot.send_message(uid, prompts.get(call.data, "Введи значение:"),
-                     reply_markup=kb([("❌ Отмена", "cancel_input")]))
-
-
-@bot.callback_query_handler(func=lambda c: c.data == "cancel_input")
-def cb_cancel_input(call):
-    _waiting.pop(call.from_user.id, None)
-    bot.answer_callback_query(call.id, "Отменено")
-    text, btns = main_menu(call.from_user.id)
-    bot.send_message(call.from_user.id, text, reply_markup=btns, parse_mode="HTML")
-
-
-@bot.message_handler(func=lambda m: m.from_user and m.from_user.id in _waiting and m.chat.type == "private")
-def handle_input(msg):
-    uid    = msg.from_user.id
-    action = _waiting.pop(uid, None)
-    if not action:
-        return
-
-    u    = get_user(uid)
-    text = msg.text.strip()
-
-    if action == "action_rename":
-        name = text[:20]
-        with db() as c:
-            c.execute("UPDATE users SET name=%s WHERE id=%s", (name, uid))
-        bot.send_message(uid, f"✅ Имя изменено на <b>{name}</b>", parse_mode="HTML",
-                         reply_markup=kb([("🏠 Меню", "home")]))
-        return
-
-    if action == "action_transfer":
-        parts = text.split()
-        if len(parts) < 2:
-            bot.send_message(uid, "❌ Формат: @username сумма")
-            return
-        target_un = parts[0].lstrip("@")
-        try:
-            amount = int(parts[1].replace(" ", ""))
-        except ValueError:
-            bot.send_message(uid, "❌ Неверная сумма")
-            return
-        if amount <= 0:
-            bot.send_message(uid, "❌ Сумма > 0")
-            return
-        fee   = int(amount * TRANSFER_FEE)
-        total = amount + fee
-        if u["balance"] < total:
-            bot.send_message(uid, f"❌ Нужно {fmt(total)} (комиссия {fmt(fee)})")
-            return
-        with db() as c:
-            c.execute("SELECT id, name FROM users WHERE name ILIKE %s", (f"%{target_un}%",))
-            row = c.fetchone()
-        if not row:
-            bot.send_message(uid, "❌ Пользователь не найден")
-            return
-        to_uid = row["id"]
-        if to_uid == uid:
-            bot.send_message(uid, "❌ Нельзя переводить самому себе")
-            return
-        add_balance(uid, -total)
-        add_balance(to_uid, amount)
-        with db() as c:
-            c.execute("INSERT INTO transfers (from_id,to_id,amount,fee,ts) VALUES (%s,%s,%s,%s,%s)",
-                      (uid, to_uid, amount, fee, now()))
-        try:
-            bot.send_message(to_uid, f"💸 Вам перевели <b>{fmt(amount)} {CURRENCY}</b>", parse_mode="HTML")
-        except Exception:
-            pass
-        bot.send_message(uid,
-            f"✅ Переведено <b>{fmt(amount)}</b> + комиссия <b>{fmt(fee)}</b>",
-            parse_mode="HTML",
-            reply_markup=kb([("🏠 Меню", "home")]))
-        return
-
-    # Банк
-    try:
-        amount = int(text.replace(" ", "").replace(",", ""))
-    except ValueError:
-        bot.send_message(uid, "❌ Введи число")
-        return
-    if amount <= 0:
-        bot.send_message(uid, "❌ Сумма > 0")
-        return
+def _do_bank_op(uid: int, action: str, amount: int):
+    u = get_user(uid)
+    home_btn = kb([("🏦 Банк", "menu_bank"), ("🏠 Меню", "home")])
 
     if action == "bank_deposit":
         if u["balance"] < amount:
-            bot.send_message(uid, "❌ Недостаточно на кошельке")
-            return
+            bot.send_message(uid, "❌ Недостаточно наличных"); return
         with db() as c:
-            c.execute("UPDATE users SET balance=balance-%s, bank=bank+%s, last_interest_calc=%s WHERE id=%s",
+            c.execute("UPDATE users SET balance=balance-?, bank=bank+?, last_interest=? WHERE id=?",
                       (amount, amount, now(), uid))
-        bot.send_message(uid, f"✅ Внесено <b>{fmt(amount)} {CURRENCY}</b> на депозит",
-                         parse_mode="HTML", reply_markup=kb([("🏦 Банк","menu_bank"),("🏠 Меню","home")]))
+        bot.send_message(uid, f"✅ Внесено: <b>{fmt(amount)} {CUR}</b>",
+                         parse_mode="HTML", reply_markup=home_btn)
 
     elif action == "bank_withdraw":
-        u = get_user(uid)
         if u["bank"] < amount:
-            bot.send_message(uid, "❌ Недостаточно в банке")
-            return
+            bot.send_message(uid, "❌ Недостаточно в банке"); return
         with db() as c:
-            c.execute("UPDATE users SET balance=balance+%s, bank=bank-%s WHERE id=%s",
+            c.execute("UPDATE users SET balance=balance+?, bank=bank-? WHERE id=?",
                       (amount, amount, uid))
-        bot.send_message(uid, f"✅ Снято <b>{fmt(amount)} {CURRENCY}</b>",
-                         parse_mode="HTML", reply_markup=kb([("🏦 Банк","menu_bank"),("🏠 Меню","home")]))
+        bot.send_message(uid, f"✅ Снято: <b>{fmt(amount)} {CUR}</b>",
+                         parse_mode="HTML", reply_markup=home_btn)
 
     elif action == "bank_loan":
-        if amount > LOAN_MAX:
-            bot.send_message(uid, f"❌ Максимум кредита: {fmt(LOAN_MAX)}")
-            return
         with db() as c:
-            c.execute("SELECT amount FROM loans WHERE user_id=%s", (uid,))
-            existing = c.fetchone()
-        if existing and existing["amount"] > 0:
-            bot.send_message(uid, "❌ У тебя уже есть непогашенный кредит")
-            return
-        repay  = int(amount * (1 + LOAN_RATE))
-        due    = now() + 7 * 86400
+            c.execute("SELECT amount FROM loans WHERE user_id=?", (uid,))
+            ex = c.fetchone()
+        if ex and ex["amount"] > 0:
+            bot.send_message(uid, "❌ Уже есть кредит"); return
+        if amount > LOAN_MAX:
+            bot.send_message(uid, f"❌ Макс: {fmt(LOAN_MAX)}"); return
+        if u["bank"] < 1_000:
+            bot.send_message(uid, "❌ Нужно ≥1 000 на вкладе для кредита"); return
+        debt = int(amount * (1 + LOAN_RATE))
+        due  = now() + 7 * 86400
         add_balance(uid, amount)
         with db() as c:
-            c.execute("""INSERT INTO loans (user_id, amount, due_at, taken_at) VALUES (%s,%s,%s,%s)
-                         ON CONFLICT (user_id) DO UPDATE SET amount=%s, due_at=%s, taken_at=%s""",
-                      (uid, repay, due, now(), repay, due, now()))
+            c.execute("INSERT OR REPLACE INTO loans (user_id,amount,due_at,taken_at) VALUES (?,?,?,?)",
+                      (uid, debt, due, now()))
         bot.send_message(uid,
-            f"💳 Кредит <b>{fmt(amount)}</b> выдан!\n"
-            f"Вернуть: <b>{fmt(repay)} {CURRENCY}</b> до {datetime.fromtimestamp(due).strftime('%d.%m')}",
-            parse_mode="HTML", reply_markup=kb([("🏦 Банк","menu_bank"),("🏠 Меню","home")]))
+            f"✅ Кредит: <b>{fmt(amount)} {CUR}</b>\n"
+            f"Вернуть <b>{fmt(debt)}</b> до {datetime.fromtimestamp(due).strftime('%d.%m.%Y')}",
+            parse_mode="HTML", reply_markup=home_btn)
 
     elif action == "bank_repay":
         with db() as c:
-            c.execute("SELECT amount FROM loans WHERE user_id=%s", (uid,))
+            c.execute("SELECT amount FROM loans WHERE user_id=?", (uid,))
             loan = c.fetchone()
-        if not loan or not loan["amount"]:
-            bot.send_message(uid, "❌ Нет активного кредита")
-            return
-        debt = loan["amount"]
-        pay  = min(amount, debt)
+        if not loan or loan["amount"] == 0:
+            bot.send_message(uid, "❌ Нет кредита"); return
+        pay = min(amount, loan["amount"])
         if u["balance"] < pay:
-            bot.send_message(uid, f"❌ Недостаточно средств")
-            return
+            bot.send_message(uid, "❌ Недостаточно"); return
         add_balance(uid, -pay)
-        new_debt = debt - pay
+        new_debt = loan["amount"] - pay
         with db() as c:
             if new_debt <= 0:
-                c.execute("DELETE FROM loans WHERE user_id=%s", (uid,))
-                bot.send_message(uid, "✅ Кредит полностью погашен!", parse_mode="HTML",
-                                 reply_markup=kb([("🏦 Банк","menu_bank"),("🏠 Меню","home")]))
+                c.execute("DELETE FROM loans WHERE user_id=?", (uid,))
+                extra = "\n🎉 Кредит погашен!"
             else:
-                c.execute("UPDATE loans SET amount=%s WHERE user_id=%s", (new_debt, uid))
-                bot.send_message(uid,
-                    f"✅ Погашено <b>{fmt(pay)}</b>. Остаток: <b>{fmt(new_debt)} {CURRENCY}</b>",
-                    parse_mode="HTML", reply_markup=kb([("🏦 Банк","menu_bank"),("🏠 Меню","home")]))
+                c.execute("UPDATE loans SET amount=? WHERE user_id=?", (new_debt, uid))
+                extra = f"\nОстаток: {fmt(new_debt)}"
+        bot.send_message(uid, f"✅ Погашено: <b>{fmt(pay)} {CUR}</b>{extra}",
+                         parse_mode="HTML", reply_markup=home_btn)
+
+    elif action == "term_deposit":
+        if u["balance"] < amount:
+            bot.send_message(uid, "❌ Недостаточно наличных"); return
+        with db() as c:
+            c.execute("SELECT amount FROM term_deposits WHERE user_id=?", (uid,))
+            ex = c.fetchone()
+        if ex and ex["amount"] > 0:
+            bot.send_message(uid, "❌ Срочный вклад уже есть. Сначала заберите."); return
+        add_balance(uid, -amount)
+        locked = now() + 7 * 86400
+        with db() as c:
+            c.execute("INSERT OR REPLACE INTO term_deposits (user_id,amount,rate,locked_until,started_at) "
+                      "VALUES (?,?,?,?,?)", (uid, amount, TERM_RATE, locked, now()))
+        bot.send_message(uid,
+            f"✅ Срочный вклад: <b>{fmt(amount)} {CUR}</b>\n"
+            f"Доступно: {datetime.fromtimestamp(locked).strftime('%d.%m.%Y')}",
+            parse_mode="HTML", reply_markup=home_btn)
+
+    elif action == "term_withdraw":
+        with db() as c:
+            c.execute("SELECT * FROM term_deposits WHERE user_id=?", (uid,))
+            td = c.fetchone()
+        if not td or td["amount"] == 0:
+            bot.send_message(uid, "❌ Нет срочного вклада"); return
+        days = (now() - td["started_at"]) / 86400
+        earned = int(td["amount"] * td["rate"] * days)
+        total  = td["amount"] + earned
+        penalty = 0
+        if td["locked_until"] > now():
+            penalty = total // 2
+            total   = total - penalty
+        with db() as c:
+            c.execute("DELETE FROM term_deposits WHERE user_id=?", (uid,))
+        add_balance(uid, total)
+        pen_str = f"\n⚠️ Штраф: -{fmt(penalty)}" if penalty else ""
+        bot.send_message(uid,
+            f"✅ Снято: <b>{fmt(total)} {CUR}</b>\n"
+            f"Проценты: +{fmt(earned)}{pen_str}",
+            parse_mode="HTML", reply_markup=home_btn)
 
 
 # ══════════════════════════════════════════════
-# 14. БИРЖА
+# 15. БИРЖА
 # ══════════════════════════════════════════════
 
-def get_stock() -> dict:
+def _get_stock() -> dict:
     with db() as c:
-        c.execute("SELECT * FROM stocks WHERE ticker=%s", (TICKER,))
-        row = c.fetchone()
-    return dict(row) if row else {"price": STOCK_PRICE_START, "prev_price": STOCK_PRICE_START}
+        c.execute("SELECT * FROM stocks WHERE ticker=?", (TICKER,))
+        return dict(c.fetchone())
 
-def stock_trend(n=10) -> list:
+def _stock_history(n=10) -> list:
     with db() as c:
-        c.execute("SELECT price, ts FROM stock_history WHERE ticker=%s ORDER BY ts DESC LIMIT %s",
+        c.execute("SELECT price, ts FROM stock_history WHERE ticker=? ORDER BY ts DESC LIMIT ?",
                   (TICKER, n))
-        rows = c.fetchall()
-    return list(reversed(rows))
+        return list(reversed(c.fetchall()))
+
+def _market_impact(qty: int, direction: str):
+    with db() as c:
+        c.execute("SELECT price FROM stocks WHERE ticker=?", (TICKER,))
+        row = c.fetchone()
+        if not row: return
+        p = row["price"]
+        delta = p * 0.001 * qty
+        new_p = max(100, int(p + (delta if direction == "buy" else -delta)))
+        c.execute("UPDATE stocks SET prev_price=price, price=?, updated_at=? WHERE ticker=?",
+                  (new_p, now(), TICKER))
+        c.execute("INSERT INTO stock_history (ticker,price,ts) VALUES (?,?,?)",
+                  (TICKER, new_p, now()))
 
 
 @bot.callback_query_handler(func=lambda c: c.data == "menu_stock")
 def cb_stock(call):
     uid = call.from_user.id
-    st  = get_stock()
-    price = st["price"]
-    prev  = st["prev_price"]
-    chg   = (price - prev) / prev * 100
-    arrow = "📈" if chg >= 0 else "📉"
+    st  = _get_stock()
+    chg = (st["price"] - st["prev_price"]) / st["prev_price"] * 100
 
     with db() as c:
-        c.execute("SELECT shares, avg_buy FROM portfolios WHERE user_id=%s AND ticker=%s", (uid, TICKER))
+        c.execute("SELECT shares, avg_buy FROM portfolios WHERE user_id=? AND ticker=?",
+                  (uid, TICKER))
         port = c.fetchone()
 
-    port_str = "нет"
-    if port and port["shares"]:
-        pnl = (price - port["avg_buy"]) * port["shares"]
+    hist = _stock_history(8)
+    mini = ""
+    if len(hist) >= 2:
+        prices = [r["price"] for r in hist]
+        lo, hi = min(prices), max(prices)
+        for p in prices:
+            if hi == lo:       mini += "━"
+            elif p >= hi*0.85: mini += "▲"
+            elif p <= lo*1.15: mini += "▼"
+            else:              mini += "─"
+
+    arrow = "📈" if chg >= 0 else "📉"
+    port_str = ""
+    if port and port["shares"] > 0:
+        pnl = (st["price"] - port["avg_buy"]) * port["shares"]
         pnl_str = f"+{fmt(pnl)}" if pnl >= 0 else fmt(pnl)
-        port_str = f"{port['shares']} шт. (P&L: {pnl_str})"
+        port_str = (
+            f"\n——\n"
+            f"📂 {port['shares']} акций  avg {fmt(port['avg_buy'])}\n"
+            f"P&L: <b>{pnl_str} {CUR}</b>"
+        )
 
     text = (
         f"<b>📈 Биржа — {TICKER}</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"Цена: <b>{fmt(price)} {CURRENCY}</b>  {arrow} {chg:+.1f}%\n"
-        f"Портфель: <b>{port_str}</b>"
+        f"Цена: <b>{fmt(st['price'])} {CUR}</b>  {arrow} {chg:+.1f}%\n"
+        f"<code>{mini}</code>"
+        f"{port_str}"
     )
-    buttons = kb(
+    _edit(call, text, kb(
         [("🛒 Купить", "stock_buy"), ("💰 Продать", "stock_sell")],
-        [("📊 История", "stock_history"), ("🏠 Меню", "home")]
-    )
-    try:
-        bot.edit_message_text(text, uid, call.message.message_id,
-                              reply_markup=buttons, parse_mode="HTML")
-    except Exception:
-        bot.send_message(uid, text, reply_markup=buttons, parse_mode="HTML")
-    bot.answer_callback_query(call.id)
+        [("📊 История", "stock_hist"), ("🔄 Обновить", "menu_stock")],
+        [("🏠 Меню", "home")],
+    ))
 
 
-@bot.callback_query_handler(func=lambda c: c.data in ["stock_buy", "stock_sell"])
-def cb_stock_action(call):
+@bot.callback_query_handler(func=lambda c: c.data == "stock_hist")
+def cb_stock_hist(call):
     uid = call.from_user.id
-    _waiting[uid] = call.data
-    st  = get_stock()
-    action_str = "купить" if call.data == "stock_buy" else "продать"
-    bot.answer_callback_query(call.id)
-    bot.send_message(uid,
-        f"Цена: <b>{fmt(st['price'])} {CURRENCY}</b>\nСколько акций {action_str}?",
-        parse_mode="HTML",
-        reply_markup=kb([("❌ Отмена", "cancel_input")]))
-
-
-@bot.message_handler(func=lambda m: m.from_user and _waiting.get(m.from_user.id) in ["stock_buy","stock_sell"] and m.chat.type == "private")
-def handle_stock_input(msg):
-    uid    = msg.from_user.id
-    action = _waiting.pop(uid, None)
-    try:
-        qty = int(msg.text.strip())
-    except ValueError:
-        bot.send_message(uid, "❌ Введи число акций")
-        return
-    if qty <= 0:
-        bot.send_message(uid, "❌ Количество > 0")
-        return
-
-    st    = get_stock()
-    price = st["price"]
-    u     = get_user(uid)
-
-    if action == "stock_buy":
-        total = price * qty
-        fee   = int(total * 0.02)
-        cost  = total + fee
-        if u["balance"] < cost:
-            bot.send_message(uid, f"❌ Нужно {fmt(cost)} (включая комиссию {fmt(fee)})")
-            return
-        add_balance(uid, -cost)
-        with db() as c:
-            c.execute("""INSERT INTO portfolios (user_id, ticker, shares, avg_buy)
-                         VALUES (%s, %s, %s, %s)
-                         ON CONFLICT (user_id, ticker) DO UPDATE SET
-                             avg_buy = (portfolios.avg_buy * portfolios.shares + %s * %s) / (portfolios.shares + %s),
-                             shares  = portfolios.shares + %s""",
-                      (uid, TICKER, qty, price, price, qty, qty, qty))
-        _market_impact(qty, "buy")
-        bot.send_message(uid,
-            f"✅ Куплено <b>{qty} акций {TICKER}</b>\n"
-            f"По {fmt(price)} + комиссия {fmt(fee)}\nИтого: {fmt(cost)} {CURRENCY}",
-            parse_mode="HTML",
-            reply_markup=kb([("📈 Биржа","menu_stock"),("🏠 Меню","home")]))
-
-    elif action == "stock_sell":
-        with db() as c:
-            c.execute("SELECT shares, avg_buy FROM portfolios WHERE user_id=%s AND ticker=%s", (uid, TICKER))
-            port = c.fetchone()
-        if not port or port["shares"] < qty:
-            bot.send_message(uid, "❌ Недостаточно акций")
-            return
-        total = price * qty
-        fee   = int(total * 0.02)
-        gain  = total - fee
-        pnl   = (price - port["avg_buy"]) * qty
-        add_balance(uid, gain)
-        with db() as c:
-            new_shares = port["shares"] - qty
-            if new_shares == 0:
-                c.execute("DELETE FROM portfolios WHERE user_id=%s AND ticker=%s", (uid, TICKER))
-            else:
-                c.execute("UPDATE portfolios SET shares=%s WHERE user_id=%s AND ticker=%s",
-                          (new_shares, uid, TICKER))
-        _market_impact(qty, "sell")
-        pnl_str = f"+{fmt(pnl)}" if pnl >= 0 else fmt(pnl)
-        bot.send_message(uid,
-            f"✅ Продано <b>{qty} акций {TICKER}</b>\n"
-            f"Получено: <b>{fmt(gain)} {CURRENCY}</b>\nP&L: <b>{pnl_str}</b>",
-            parse_mode="HTML",
-            reply_markup=kb([("📈 Биржа","menu_stock"),("🏠 Меню","home")]))
-
-
-def _market_impact(qty: int, direction: str):
-    with db() as c:
-        c.execute("SELECT price FROM stocks WHERE ticker=%s", (TICKER,))
-        row = c.fetchone()
-        if not row:
-            return
-        price  = row["price"]
-        impact = int(price * 0.001 * qty)
-        new_price = max(100, price + (impact if direction == "buy" else -impact))
-        c.execute("UPDATE stocks SET prev_price=price, price=%s WHERE ticker=%s", (new_price, TICKER))
-        c.execute("INSERT INTO stock_history (ticker, price, ts) VALUES (%s, %s, %s)",
-                  (TICKER, new_price, now()))
-
-
-@bot.callback_query_handler(func=lambda c: c.data == "stock_history")
-def cb_stock_history(call):
-    uid     = call.from_user.id
-    history = stock_trend(n=10)
-    if not history:
-        bot.answer_callback_query(call.id, "История пуста")
-        return
-
+    hist = _stock_history(10)
+    if not hist:
+        bot.answer_callback_query(call.id, "История пуста"); return
     lines = []
-    for i, row in enumerate(history):
+    for i, row in enumerate(hist):
         dt = datetime.fromtimestamp(row["ts"]).strftime("%d.%m %H:%M")
         p  = row["price"]
         if i > 0:
-            prev = history[i-1]["price"]
+            prev = hist[i-1]["price"]
             chg  = (p - prev) / prev * 100
             icon = "🟢" if p >= prev else "🔴"
             lines.append(f"{icon} {dt}  <b>{fmt(p)}</b>  {chg:+.1f}%")
         else:
             lines.append(f"⬜ {dt}  <b>{fmt(p)}</b>")
-
     text = f"<b>📊 История {TICKER}</b>\n\n" + "\n".join(lines)
-    try:
-        bot.edit_message_text(text, uid, call.message.message_id,
-                              reply_markup=kb([("📈 Биржа","menu_stock"),("🏠 Меню","home")]),
-                              parse_mode="HTML")
-    except Exception:
-        bot.send_message(uid, text, parse_mode="HTML",
-                         reply_markup=kb([("📈 Биржа","menu_stock"),("🏠 Меню","home")]))
-    bot.answer_callback_query(call.id)
+    _edit(call, text, kb([("📈 Биржа", "menu_stock"), ("🏠 Меню", "home")]))
+
+
+def _do_stock_op(uid: int, action: str, qty: int):
+    st = _get_stock()
+    u  = get_user(uid)
+    home_btn = kb([("📈 Биржа", "menu_stock"), ("🏠 Меню", "home")])
+
+    if action == "stock_buy":
+        fee   = int(st["price"] * qty * 0.02)
+        cost  = st["price"] * qty + fee
+        if u["balance"] < cost:
+            bot.send_message(uid, f"❌ Нужно {fmt(cost)} (комиссия {fmt(fee)})"); return
+        add_balance(uid, -cost)
+        with db() as c:
+            c.execute("""INSERT INTO portfolios (user_id,ticker,shares,avg_buy) VALUES (?,?,?,?)
+                         ON CONFLICT(user_id,ticker) DO UPDATE SET
+                         avg_buy=(avg_buy*shares+?*?)/(shares+?),
+                         shares=shares+?""",
+                      (uid, TICKER, qty, st["price"], st["price"], qty, qty, qty))
+        _market_impact(qty, "buy")
+        grant_achievement(uid, "investor")
+        bot.send_message(uid,
+            f"✅ Куплено <b>{qty} акций {TICKER}</b>  @{fmt(st['price'])}\n"
+            f"Комиссия: {fmt(fee)}  Итого: {fmt(cost)} {CUR}",
+            parse_mode="HTML", reply_markup=home_btn)
+
+    elif action == "stock_sell":
+        with db() as c:
+            c.execute("SELECT shares, avg_buy FROM portfolios WHERE user_id=? AND ticker=?",
+                      (uid, TICKER))
+            port = c.fetchone()
+        if not port or port["shares"] < qty:
+            bot.send_message(uid, "❌ Недостаточно акций"); return
+        fee  = int(st["price"] * qty * 0.02)
+        gain = st["price"] * qty - fee
+        pnl  = (st["price"] - port["avg_buy"]) * qty
+        add_balance(uid, gain)
+        with db() as c:
+            new_sh = port["shares"] - qty
+            if new_sh == 0:
+                c.execute("DELETE FROM portfolios WHERE user_id=? AND ticker=?", (uid, TICKER))
+            else:
+                c.execute("UPDATE portfolios SET shares=? WHERE user_id=? AND ticker=?",
+                          (new_sh, uid, TICKER))
+        _market_impact(qty, "sell")
+        pnl_str = f"+{fmt(pnl)}" if pnl >= 0 else fmt(pnl)
+        bot.send_message(uid,
+            f"✅ Продано <b>{qty} акций</b>\n"
+            f"Получено: <b>{fmt(gain)} {CUR}</b>  P&L: <b>{pnl_str}</b>",
+            parse_mode="HTML", reply_markup=home_btn)
 
 
 def _stock_scheduler():
-    print(f"[stocks] планировщик запущен ({STOCK_UPDATE//60}мин)")
+    print(f"[stocks] старт ({STOCK_TICK//60}мин)")
     while True:
-        time.sleep(STOCK_UPDATE)
+        time.sleep(STOCK_TICK)
         try:
             with db() as c:
-                c.execute("SELECT price FROM stocks WHERE ticker=%s", (TICKER,))
+                c.execute("SELECT price FROM stocks WHERE ticker=?", (TICKER,))
                 row = c.fetchone()
-                if not row:
-                    continue
-                old   = row["price"]
-                drift = (STOCK_PRICE_START - old) * 0.01
-                vol   = old * STOCK_VOLATILITY
+                if not row: continue
+                old = row["price"]
+                drift = (STOCK_START - old) * 0.01
+                vol   = old * STOCK_VOL
                 new   = max(100, int(old + drift + random.gauss(0, vol)))
-                c.execute("UPDATE stocks SET prev_price=price, price=%s, updated_at=%s WHERE ticker=%s",
+                c.execute("UPDATE stocks SET prev_price=price, price=?, updated_at=? WHERE ticker=?",
                           (new, now(), TICKER))
-                c.execute("INSERT INTO stock_history (ticker, price, ts) VALUES (%s, %s, %s)",
+                c.execute("INSERT INTO stock_history (ticker,price,ts) VALUES (?,?,?)",
                           (TICKER, new, now()))
             chg = (new - old) / old * 100
-            if abs(chg) >= 2:
+            if abs(chg) >= 3:
                 arrow = "📈" if new > old else "📉"
                 send_alert(f"{arrow} {TICKER}: {fmt(old)} → <b>{fmt(new)}</b> ({chg:+.1f}%)")
         except Exception as e:
-            print(f"[stocks] ошибка: {e}")
+            print(f"[stocks] err: {e}")
 
 
 # ══════════════════════════════════════════════
-# 15. ИГРЫ
+# 16. ИГРЫ — МЕНЮ
 # ══════════════════════════════════════════════
 
 @bot.callback_query_handler(func=lambda c: c.data == "menu_games")
 def cb_games_menu(call):
-    uid  = call.from_user.id
-    text = "<b>🎰 Игры</b>\n━━━━━━━━━━━━━━━━━━\nВыбери игру:"
-    buttons = kb(
-        [("🎲 Кубик",   "game_dice"),  ("🎰 Слоты",  "game_slots")],
-        [("🎡 Рулетка", "game_roul"),  ("💣 Мины",   "game_mines")],
-        [("🏆 Лотерея", "game_lotto"), ("⚡ Краш",   "game_crash")],
-        [("🏠 Меню", "home")]
+    uid = call.from_user.id
+    text = (
+        "<b>🎰 Игры</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "Выбери игру:"
     )
-    try:
-        bot.edit_message_text(text, uid, call.message.message_id,
-                              reply_markup=buttons, parse_mode="HTML")
-    except Exception:
-        bot.send_message(uid, text, reply_markup=buttons, parse_mode="HTML")
-    bot.answer_callback_query(call.id)
+    _edit(call, text, kb(
+        [("🎲 Кубик",   "game_dice"),   ("🎰 Слоты",    "game_slots")],
+        [("🎡 Рулетка", "game_roul"),   ("⚡ Краш",     "game_crash")],
+        [("💣 Мины",    "game_mines"),  ("🏯 Башня",    "game_tower")],
+        [("🏆 Лотерея", "game_lotto"),  ("📜 Статы",    "game_stats")],
+        [("🏠 Меню", "home")],
+    ))
 
 
-# ── Кубик ──────────────────────────────────
+@bot.callback_query_handler(func=lambda c: c.data == "game_stats")
+def cb_game_stats(call):
+    uid = call.from_user.id
+    with db() as c:
+        c.execute("SELECT game, COUNT(*) as cnt, SUM(result) as profit "
+                  "FROM game_log WHERE user_id=? GROUP BY game", (uid,))
+        rows = c.fetchall()
+    if not rows:
+        _edit(call, "📜 Нет игр.", kb([("🎰 Игры", "menu_games"), ("🏠 Меню", "home")])); return
+    lines = []
+    for r in rows:
+        profit = r["profit"] or 0
+        sign   = "+" if profit >= 0 else ""
+        lines.append(f"• {r['game']}: {r['cnt']} игр  {sign}{fmt(profit)}")
+    _edit(call, "<b>📜 Статистика игр</b>\n━━━━━━━━━━━━━━━━━━\n" + "\n".join(lines),
+          kb([("🎰 Игры", "menu_games"), ("🏠 Меню", "home")]))
 
-@bot.callback_query_handler(func=lambda c: c.data == "game_dice")
-def cb_dice_menu(call):
-    _waiting[call.from_user.id] = "game_dice"
-    bot.answer_callback_query(call.id)
-    bot.send_message(call.from_user.id, "<b>🎲 Кубик</b>\nВведи ставку:",
-                     parse_mode="HTML", reply_markup=kb([("❌ Отмена", "cancel_input")]))
 
+# ── Кубик ──
 
-@bot.message_handler(func=lambda m: m.from_user and _waiting.get(m.from_user.id) == "game_dice" and m.chat.type == "private")
-def handle_dice_game(msg):
-    uid = msg.from_user.id
-    _waiting.pop(uid, None)
-    u = get_user(uid)
-    try:
-        bet = int(msg.text.strip())
-    except ValueError:
-        bot.send_message(uid, "❌ Введи число")
-        return
-    if bet <= 0 or bet > u["balance"]:
-        bot.send_message(uid, f"❌ Неверная ставка (баланс: {fmt(u['balance'])})")
-        return
-
+def _game_dice(uid: int, bet: int):
+    add_balance(uid, -bet)
     sent = bot.send_dice(uid, emoji="🎲")
-    time.sleep(3)
+    time.sleep(2.8)
     val = sent.dice.value
     if val >= 4:
-        win = int(bet * 1.5)
-        add_balance(uid, win - bet)
-        result = f"🎲 Выпало <b>{val}</b> — победа! +{fmt(win-bet)} {CURRENCY}"
+        win = int(bet * 2)
+        add_balance(uid, win)
+        result = win - bet
+        txt = f"🎲 Выпало <b>{val}</b> — победа! +{fmt(result)} {CUR}"
     else:
-        add_balance(uid, -bet)
-        result = f"🎲 Выпало <b>{val}</b> — проигрыш. -{fmt(bet)} {CURRENCY}"
-
-    bot.send_message(uid, result, parse_mode="HTML",
-                     reply_markup=kb([("🎲 Ещё","game_dice"),("🎮 Игры","menu_games"),("🏠 Меню","home")]))
-
-
-# ── Слоты ──────────────────────────────────
-
-SLOT_SYMBOLS = ["🍒","🍋","🍊","🍇","⭐","💎"]
-SLOT_PAYOUTS = {
-    "💎💎💎": 10, "⭐⭐⭐": 7, "🍇🍇🍇": 5,
-    "🍊🍊🍊": 4,  "🍋🍋🍋": 3, "🍒🍒🍒": 2,
-}
-
-@bot.callback_query_handler(func=lambda c: c.data == "game_slots")
-def cb_slots_menu(call):
-    _waiting[call.from_user.id] = "game_slots"
-    bot.answer_callback_query(call.id)
-    bot.send_message(call.from_user.id, "<b>🎰 Слоты</b>\nВведи ставку:",
-                     parse_mode="HTML", reply_markup=kb([("❌ Отмена", "cancel_input")]))
+        result = -bet
+        txt = f"🎲 Выпало <b>{val}</b> — проигрыш. -{fmt(bet)} {CUR}"
+    log_game(uid, "Кубик", bet, result)
+    check_milestones(uid)
+    bot.send_message(uid, txt, parse_mode="HTML",
+                     reply_markup=kb([("🎲 Ещё", "game_dice"),
+                                      ("🎰 Игры", "menu_games"), ("🏠 Меню", "home")]))
 
 
-@bot.message_handler(func=lambda m: m.from_user and _waiting.get(m.from_user.id) == "game_slots" and m.chat.type == "private")
-def handle_slots_game(msg):
-    uid = msg.from_user.id
-    _waiting.pop(uid, None)
-    u = get_user(uid)
-    try:
-        bet = int(msg.text.strip())
-    except ValueError:
-        bot.send_message(uid, "❌ Введи число")
-        return
-    if bet <= 0 or bet > u["balance"]:
-        bot.send_message(uid, f"❌ Неверная ставка (баланс: {fmt(u['balance'])})")
-        return
+# ── Слоты ──
 
-    reels = [random.choice(SLOT_SYMBOLS) for _ in range(3)]
+SLOT_SYM  = ["🍒","🍋","🍊","🍇","⭐","💎"]
+SLOT_PAY  = {"💎💎💎": 12, "⭐⭐⭐": 8, "🍇🍇🍇": 5,
+             "🍊🍊🍊": 4,  "🍋🍋🍋": 3, "🍒🍒🍒": 2}
+
+def _game_slots(uid: int, bet: int):
+    vip   = has_item(uid, "slots_vip") > 0
+    reels = [random.choice(SLOT_SYM) for _ in range(3)]
     combo = "".join(reels)
-    mult  = SLOT_PAYOUTS.get(combo, 0)
+    mult  = SLOT_PAY.get(combo, 0)
+    if vip and mult > 0:
+        mult = int(mult * 1.5)
 
+    add_balance(uid, -bet)
     if mult:
         win = bet * mult
-        add_balance(uid, win - bet)
-        result = f"🎰 {combo}\n🎉 Джекпот x{mult}! +{fmt(win-bet)} {CURRENCY}"
+        add_balance(uid, win)
+        result = win - bet
+        txt = f"🎰 {combo}\n🎉 x{mult}!  +{fmt(result)} {CUR}"
     else:
-        add_balance(uid, -bet)
-        result = f"🎰 {combo}\n😔 Нет совпадений. -{fmt(bet)} {CURRENCY}"
-
-    bot.send_message(uid, result, parse_mode="HTML",
-                     reply_markup=kb([("🎰 Ещё","game_slots"),("🎮 Игры","menu_games"),("🏠 Меню","home")]))
-
-
-# ── Рулетка ────────────────────────────────
-
-@bot.callback_query_handler(func=lambda c: c.data == "game_roul")
-def cb_roulette_menu(call):
-    uid = call.from_user.id
-    _waiting[uid] = "game_roulette"
-    bot.answer_callback_query(call.id)
-    bot.send_message(uid,
-        "<b>🎡 Рулетка</b>\n"
-        "🔴 Красное (x2)   ⬛ Чёрное (x2)\n🟢 Зеро (x14)\n\n"
-        "Введи: <code>цвет сумма</code>\nПример: <code>красное 1000</code>",
-        parse_mode="HTML", reply_markup=kb([("❌ Отмена","cancel_input")]))
+        result = -bet
+        txt = f"🎰 {combo}\n😔  -{fmt(bet)} {CUR}"
+    log_game(uid, "Слоты", bet, result)
+    check_milestones(uid)
+    bot.send_message(uid, txt, parse_mode="HTML",
+                     reply_markup=kb([("🎰 Ещё", "game_slots"),
+                                      ("🎰 Игры", "menu_games"), ("🏠 Меню", "home")]))
 
 
-@bot.message_handler(func=lambda m: m.from_user and _waiting.get(m.from_user.id) == "game_roulette" and m.chat.type == "private")
-def handle_roulette(msg):
-    uid = msg.from_user.id
-    _waiting.pop(uid, None)
-    u = get_user(uid)
-    parts = msg.text.strip().lower().split()
-    if len(parts) < 2:
-        bot.send_message(uid, "❌ Формат: красное 1000")
-        return
-    color_map = {
-        "красное":"red","красный":"red","r":"red",
-        "чёрное":"black","черное":"black","b":"black",
-        "зеро":"zero","0":"zero"
-    }
-    color = color_map.get(parts[0])
+# ── Рулетка ──
+
+COLOR_MAP = {
+    "красное": "red","красный":"red","red":"red","r":"red",
+    "чёрное":"black","черное":"black","black":"black","b":"black",
+    "зеро":"zero","0":"zero","zero":"zero",
+}
+COLOR_MULT = {"red": 2, "black": 2, "zero": 14}
+COLOR_ICON = {"red": "🔴","black": "⬛","zero": "🟢"}
+
+def _game_roulette(uid: int, color_input: str, bet: int):
+    color = COLOR_MAP.get(color_input.lower())
     if not color:
-        bot.send_message(uid, "❌ Выбери: красное / чёрное / зеро")
-        return
-    try:
-        bet = int(parts[1])
-    except ValueError:
-        bot.send_message(uid, "❌ Неверная ставка")
-        return
-    if bet <= 0 or bet > u["balance"]:
-        bot.send_message(uid, f"❌ Неверная ставка (баланс: {fmt(u['balance'])})")
-        return
+        bot.send_message(uid, "❌ Цвет: красное / чёрное / зеро"); return
 
     num    = random.randint(0, 36)
     actual = "zero" if num == 0 else ("red" if num % 2 == 1 else "black")
-    mults  = {"red": 2, "black": 2, "zero": 14}
-    icons  = {"red": "🔴", "black": "⬛", "zero": "🟢"}
+    add_balance(uid, -bet)
 
     if actual == color:
-        win = bet * mults[color]
-        add_balance(uid, win - bet)
-        result = f"{icons[actual]} Выпало {num} — победа! +{fmt(win-bet)} {CURRENCY}"
+        win    = bet * COLOR_MULT[color]
+        result = win - bet
+        add_balance(uid, win)
+        txt = f"{COLOR_ICON[actual]} Выпало {num} — победа! +{fmt(result)} {CUR}"
     else:
-        add_balance(uid, -bet)
-        result = f"{icons[actual]} Выпало {num} — проигрыш. -{fmt(bet)} {CURRENCY}"
+        result = -bet
+        txt = f"{COLOR_ICON[actual]} Выпало {num} — проигрыш. -{fmt(bet)} {CUR}"
 
-    bot.send_message(uid, result, parse_mode="HTML",
-                     reply_markup=kb([("🎡 Рулетка","game_roul"),("🎮 Игры","menu_games"),("🏠 Меню","home")]))
+    log_game(uid, "Рулетка", bet, result)
+    check_milestones(uid)
+    bot.send_message(uid, txt, parse_mode="HTML",
+                     reply_markup=kb([("🎡 Ещё", "game_roul"),
+                                      ("🎰 Игры", "menu_games"), ("🏠 Меню", "home")]))
 
 
-# ── Лотерея ────────────────────────────────
+# ── Краш ──
+
+_crashes: dict[int, dict] = {}
+
+def _game_crash_start(uid: int, bet: int):
+    crash_at = max(1.01, round(random.expovariate(0.9) + 1.0, 2))
+    shield   = has_item(uid, "crash_shield")
+
+    add_balance(uid, -bet)
+    _crashes[uid] = {"bet": bet, "crash": crash_at, "shield": shield, "ts": now()}
+
+    # Убрать shield из инвентаря при использовании
+    if shield:
+        with db() as c:
+            c.execute("""UPDATE inventory SET qty=qty-1
+                         WHERE user_id=? AND item_id=(
+                         SELECT id FROM items WHERE effect='crash_shield' LIMIT 1)""", (uid,))
+
+    bot.send_message(uid,
+        f"⚡ <b>Краш</b>  Ставка: {fmt(bet)}\n"
+        f"{'🛡 Страховка активна!' if shield else ''}\n"
+        f"Забери до краша:",
+        parse_mode="HTML",
+        reply_markup=kb(
+            [(f"💰 x1.5", f"crash_co_1.5_{uid}"),
+             (f"💰 x2.0", f"crash_co_2.0_{uid}"),
+             (f"💰 x3.0", f"crash_co_3.0_{uid}"),
+             (f"💰 x5.0", f"crash_co_5.0_{uid}")],
+        ))
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("crash_co_"))
+def cb_crash_cashout(call):
+    uid   = call.from_user.id
+    parts = call.data.split("_")
+    mult  = float(parts[2])
+    g_uid = int(parts[3])
+
+    if g_uid != uid:
+        bot.answer_callback_query(call.id, "Не ваша игра"); return
+
+    game = _crashes.pop(uid, None)
+    if not game:
+        bot.answer_callback_query(call.id, "Игра завершена"); return
+
+    bet = game["bet"]
+    if mult <= game["crash"]:
+        win    = int(bet * mult)
+        result = win - bet
+        add_balance(uid, win)
+        txt = f"✅ Забрал x{mult}!  +{fmt(result)} {CUR}"
+    else:
+        if game.get("shield"):
+            # Страховка — возвращаем ставку
+            add_balance(uid, bet)
+            result = 0
+            txt = f"🛡 Краш x{game['crash']}! Страховка спасла ставку."
+        else:
+            result = -bet
+            txt = f"💥 Краш на x{game['crash']}!  -{fmt(bet)} {CUR}"
+
+    log_game(uid, "Краш", bet, result)
+    check_milestones(uid)
+    try:
+        bot.edit_message_text(txt, uid, call.message.message_id,
+                              reply_markup=kb([("⚡ Ещё", "game_crash"),
+                                               ("🎰 Игры", "menu_games"), ("🏠 Меню", "home")]),
+                              parse_mode="HTML")
+    except Exception:
+        bot.send_message(uid, txt, parse_mode="HTML")
+    bot.answer_callback_query(call.id)
+
+
+# ── Мины ──
+
+_mines: dict[int, dict] = {}
+
+def _game_mines_start(uid: int, bet: int):
+    mines = random.sample(range(9), 3)
+    _mines[uid] = {"bet": bet, "mines": mines, "opened": [], "active": True}
+    add_balance(uid, -bet)
+    _send_mines_board(uid, uid)
+
+def _send_mines_board(uid: int, chat_id: int, msg_id: int = None):
+    game   = _mines.get(uid)
+    if not game: return
+    opened = game["opened"]
+    mult   = 1.0 + len(opened) * 0.6
+
+    board_rows = []
+    row = []
+    for i in range(9):
+        if i in opened:
+            row.append(("💎", f"mn_nop"))
+        else:
+            row.append(("⬜", f"mn_{uid}_{i}"))
+        if len(row) == 3:
+            board_rows.append(row); row = []
+    board_rows.append([("💰 Забрать", f"mn_co_{uid}"), ("🚪 Выйти", f"mn_exit_{uid}")])
+
+    text = (
+        f"<b>💣 Мины</b>  Ставка: {fmt(game['bet'])}\n"
+        f"Открыто: {len(opened)}/6   x{mult:.1f}\n"
+        f"Потенциал: <b>{fmt(int(game['bet']*mult))}</b>"
+    )
+    if msg_id:
+        try:
+            bot.edit_message_text(text, chat_id, msg_id,
+                                  reply_markup=kb(*board_rows), parse_mode="HTML"); return
+        except Exception: pass
+    bot.send_message(chat_id, text, reply_markup=kb(*board_rows), parse_mode="HTML")
+
+
+@bot.callback_query_handler(func=lambda c: re.match(r"^mn_\d+_\d+$", c.data))
+def cb_mine_open(call):
+    uid   = call.from_user.id
+    parts = call.data.split("_")
+    g_uid = int(parts[1])
+    cell  = int(parts[2])
+
+    if g_uid != uid:
+        bot.answer_callback_query(call.id); return
+
+    game = _mines.get(uid)
+    if not game or not game["active"]:
+        bot.answer_callback_query(call.id, "Игра завершена"); return
+
+    if cell in game["mines"]:
+        _mines.pop(uid, None)
+        log_game(uid, "Мины", game["bet"], -game["bet"])
+        check_milestones(uid)
+        bot.answer_callback_query(call.id, "💥 Мина!", show_alert=False)
+        try:
+            bot.edit_message_text(
+                f"💥 <b>БУМ!</b>  -{fmt(game['bet'])} {CUR}",
+                uid, call.message.message_id,
+                reply_markup=kb([("💣 Ещё", "game_mines"), ("🎰 Игры", "menu_games")]),
+                parse_mode="HTML")
+        except Exception: pass
+        return
+
+    game["opened"].append(cell)
+    if len(game["opened"]) >= 6:
+        mult = 1.0 + 6 * 0.6
+        win  = int(game["bet"] * mult)
+        add_balance(uid, win)
+        _mines.pop(uid, None)
+        log_game(uid, "Мины", game["bet"], win - game["bet"])
+        bot.answer_callback_query(call.id, f"🎉 +{fmt(win)}")
+        bot.send_message(uid, f"🎉 <b>Все клетки!</b> +{fmt(win)} {CUR}",
+                         parse_mode="HTML",
+                         reply_markup=kb([("💣 Ещё", "game_mines"), ("🎰 Игры", "menu_games")]))
+        return
+
+    bot.answer_callback_query(call.id, "💎")
+    _send_mines_board(uid, call.message.chat.id, call.message.message_id)
+
+
+@bot.callback_query_handler(func=lambda c: re.match(r"^mn_co_\d+$", c.data))
+def cb_mine_cashout(call):
+    uid   = call.from_user.id
+    g_uid = int(call.data[6:])
+    if g_uid != uid:
+        bot.answer_callback_query(call.id); return
+    game = _mines.pop(uid, None)
+    if not game:
+        bot.answer_callback_query(call.id, "Игра завершена"); return
+    mult = 1.0 + len(game["opened"]) * 0.6
+    win  = int(game["bet"] * mult)
+    add_balance(uid, win)
+    result = win - game["bet"]
+    log_game(uid, "Мины", game["bet"], result)
+    check_milestones(uid)
+    try:
+        bot.edit_message_text(
+            f"💰 Забрал x{mult:.1f}  +{fmt(result)} {CUR}",
+            uid, call.message.message_id,
+            reply_markup=kb([("💣 Ещё", "game_mines"), ("🎰 Игры", "menu_games"), ("🏠 Меню", "home")]),
+            parse_mode="HTML")
+    except Exception: pass
+    bot.answer_callback_query(call.id, f"✅ +{fmt(result)}")
+
+
+@bot.callback_query_handler(func=lambda c: re.match(r"^mn_exit_\d+$", c.data))
+def cb_mine_exit(call):
+    uid   = call.from_user.id
+    g_uid = int(call.data[8:])
+    if g_uid != uid:
+        bot.answer_callback_query(call.id); return
+    game = _mines.pop(uid, None)
+    if game:
+        add_balance(uid, game["bet"])  # возврат ставки при выходе без открытий
+        log_game(uid, "Мины", game["bet"], 0)
+    bot.answer_callback_query(call.id, "Выход")
+    bot.send_message(uid, "🚪 Вы вышли из игры. Ставка возвращена.",
+                     reply_markup=kb([("💣 Мины", "game_mines"), ("🏠 Меню", "home")]))
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "mn_nop")
+def cb_mine_nop(call):
+    bot.answer_callback_query(call.id)
+
+
+# ── Башня ──
+
+_towers: dict[int, dict] = {}
+
+def _game_tower_start(uid: int, bet: int):
+    add_balance(uid, -bet)
+    _towers[uid] = {"bet": bet, "level": 0, "active": True}
+    _send_tower(uid, uid)
+
+def _tower_mult(level: int) -> float:
+    return round(TOWER_MULT_BASE ** level, 2)
+
+def _send_tower(uid: int, chat_id: int, msg_id: int = None):
+    game = _towers.get(uid)
+    if not game: return
+    lvl  = game["level"]
+    mult = _tower_mult(lvl)
+    win  = int(game["bet"] * mult)
+
+    # На каждом уровне 3 ячейки, 1 — бомба
+    rows = [
+        [(f"⬜ {i+1}", f"tw_{uid}_{lvl}_{i}") for i in range(3)],
+        [("💰 Забрать", f"tw_co_{uid}"), ("🚪 Выйти", f"tw_exit_{uid}")],
+    ]
+    text = (
+        f"<b>🏯 Башня</b>  Ставка: {fmt(game['bet'])}\n"
+        f"Уровень: <b>{lvl+1}/{TOWER_LEVELS}</b>  x{mult}\n"
+        f"Потенциал: <b>{fmt(win)}</b>"
+    )
+    if msg_id:
+        try:
+            bot.edit_message_text(text, chat_id, msg_id,
+                                  reply_markup=kb(*rows), parse_mode="HTML"); return
+        except Exception: pass
+    bot.send_message(chat_id, text, reply_markup=kb(*rows), parse_mode="HTML")
+
+
+@bot.callback_query_handler(func=lambda c: re.match(r"^tw_\d+_\d+_\d+$", c.data))
+def cb_tower_cell(call):
+    uid   = call.from_user.id
+    parts = call.data.split("_")
+    g_uid = int(parts[1])
+    lvl   = int(parts[2])
+    cell  = int(parts[3])
+
+    if g_uid != uid:
+        bot.answer_callback_query(call.id); return
+
+    game = _towers.get(uid)
+    if not game or game["level"] != lvl:
+        bot.answer_callback_query(call.id, "Устарело"); return
+
+    # Вероятность мины растёт с уровнем
+    bomb_prob = 0.2 + lvl * 0.05
+    is_bomb   = random.random() < bomb_prob
+
+    if is_bomb:
+        _towers.pop(uid, None)
+        log_game(uid, "Башня", game["bet"], -game["bet"])
+        check_milestones(uid)
+        bot.answer_callback_query(call.id, "💥", show_alert=False)
+        try:
+            bot.edit_message_text(
+                f"💥 <b>ВЗРЫВ</b> на уровне {lvl+1}!  -{fmt(game['bet'])} {CUR}",
+                uid, call.message.message_id,
+                reply_markup=kb([("🏯 Ещё", "game_tower"), ("🎰 Игры", "menu_games")]),
+                parse_mode="HTML")
+        except Exception: pass
+        return
+
+    game["level"] += 1
+    if game["level"] >= TOWER_LEVELS:
+        # Победа — вершина
+        mult = _tower_mult(TOWER_LEVELS)
+        win  = int(game["bet"] * mult)
+        add_balance(uid, win)
+        _towers.pop(uid, None)
+        log_game(uid, "Башня", game["bet"], win - game["bet"])
+        bot.answer_callback_query(call.id, f"🎉 Вершина! +{fmt(win)}")
+        bot.send_message(uid,
+            f"🏆 <b>Вершина!</b>  x{mult}  +{fmt(win-game['bet'])} {CUR}",
+            parse_mode="HTML",
+            reply_markup=kb([("🏯 Ещё", "game_tower"), ("🎰 Игры", "menu_games")]))
+        return
+
+    bot.answer_callback_query(call.id, f"✅ Уровень {game['level']}")
+    _send_tower(uid, call.message.chat.id, call.message.message_id)
+
+
+@bot.callback_query_handler(func=lambda c: re.match(r"^tw_co_\d+$", c.data))
+def cb_tower_cashout(call):
+    uid   = call.from_user.id
+    g_uid = int(call.data[6:])
+    if g_uid != uid:
+        bot.answer_callback_query(call.id); return
+    game = _towers.pop(uid, None)
+    if not game:
+        bot.answer_callback_query(call.id, "Завершено"); return
+    mult = _tower_mult(game["level"])
+    win  = int(game["bet"] * mult)
+    add_balance(uid, win)
+    result = win - game["bet"]
+    log_game(uid, "Башня", game["bet"], result)
+    check_milestones(uid)
+    try:
+        bot.edit_message_text(
+            f"💰 Забрал с уровня {game['level']}  x{mult}  +{fmt(result)} {CUR}",
+            uid, call.message.message_id,
+            reply_markup=kb([("🏯 Ещё", "game_tower"), ("🎰 Игры", "menu_games"), ("🏠 Меню", "home")]),
+            parse_mode="HTML")
+    except Exception: pass
+    bot.answer_callback_query(call.id, f"✅ +{fmt(result)}")
+
+
+@bot.callback_query_handler(func=lambda c: re.match(r"^tw_exit_\d+$", c.data))
+def cb_tower_exit(call):
+    uid   = call.from_user.id
+    g_uid = int(call.data[8:])
+    if g_uid != uid:
+        bot.answer_callback_query(call.id); return
+    game = _towers.pop(uid, None)
+    if game:
+        add_balance(uid, game["bet"])
+    bot.answer_callback_query(call.id, "Выход")
+    bot.send_message(uid, "🚪 Вышли. Ставка возвращена.",
+                     reply_markup=kb([("🏯 Башня", "game_tower"), ("🏠 Меню", "home")]))
+
+
+# ── Лотерея ──
 
 @bot.callback_query_handler(func=lambda c: c.data == "game_lotto")
-def cb_lottery(call):
+def cb_lotto(call):
     uid = call.from_user.id
     with db() as c:
         c.execute("SELECT jackpot, draw_at FROM lottery WHERE id=1")
         lotto = c.fetchone()
-        c.execute("SELECT tickets FROM lottery_tickets WHERE user_id=%s", (uid,))
+        c.execute("SELECT tickets FROM lottery_tickets WHERE user_id=?", (uid,))
         my = c.fetchone()
 
-    jackpot    = lotto["jackpot"] if lotto else 0
-    draw_at    = lotto["draw_at"] if lotto else 0
+    jackpot   = lotto["jackpot"] if lotto else 0
+    draw_at   = lotto["draw_at"] if lotto else 0
     my_tickets = my["tickets"] if my else 0
     draw_str   = datetime.fromtimestamp(draw_at).strftime("%d.%m %H:%M") if draw_at > now() else "скоро"
 
     text = (
         f"<b>🏆 Лотерея</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"Джекпот: <b>{fmt(jackpot)} {CURRENCY}</b>\n"
+        f"Джекпот: <b>{fmt(jackpot)} {CUR}</b>\n"
         f"Розыгрыш: <b>{draw_str}</b>\n"
-        f"Билет: <b>{fmt(TICKET_PRICE)}</b>\n"
+        f"Билет: {fmt(TICKET_PRICE)}\n"
         f"Ваши билеты: <b>{my_tickets}</b>"
     )
-    buttons = kb(
-        [("🎟 Купить 1", "lotto_buy_1"), ("🎟 Купить 5", "lotto_buy_5")],
-        [("🏠 Меню", "home")]
-    )
-    try:
-        bot.edit_message_text(text, uid, call.message.message_id,
-                              reply_markup=buttons, parse_mode="HTML")
-    except Exception:
-        bot.send_message(uid, text, reply_markup=buttons, parse_mode="HTML")
-    bot.answer_callback_query(call.id)
+    _edit(call, text, kb(
+        [("🎟 x1 билет", "lotto_1"), ("🎟 x5 билетов", "lotto_5")],
+        [("🎟 x10 билетов", "lotto_10"), ("🔄 Обновить", "game_lotto")],
+        [("🏠 Меню", "home")],
+    ))
 
 
-@bot.callback_query_handler(func=lambda c: c.data in ["lotto_buy_1","lotto_buy_5"])
-def cb_buy_tickets(call):
-    uid  = call.from_user.id
-    qty  = 1 if call.data == "lotto_buy_1" else 5
+@bot.callback_query_handler(func=lambda c: c.data in ["lotto_1","lotto_5","lotto_10"])
+def cb_lotto_buy(call):
+    uid = call.from_user.id
+    qty_map = {"lotto_1": 1, "lotto_5": 5, "lotto_10": 10}
+    qty  = qty_map[call.data]
     cost = TICKET_PRICE * qty
     u    = get_user(uid)
     if u["balance"] < cost:
-        bot.answer_callback_query(call.id, f"❌ Нужно {fmt(cost)}", show_alert=True)
-        return
+        bot.answer_callback_query(call.id, f"❌ Нужно {fmt(cost)}", show_alert=True); return
     add_balance(uid, -cost)
     with db() as c:
-        c.execute("""INSERT INTO lottery_tickets (user_id, tickets) VALUES (%s, %s)
-                     ON CONFLICT (user_id) DO UPDATE SET tickets = lottery_tickets.tickets + %s""",
-                  (uid, qty, qty))
-        c.execute("UPDATE lottery SET jackpot=jackpot+%s WHERE id=1", (cost,))
+        c.execute("INSERT INTO lottery_tickets (user_id,tickets) VALUES (?,?) "
+                  "ON CONFLICT(user_id) DO UPDATE SET tickets=tickets+?", (uid, qty, qty))
+        c.execute("UPDATE lottery SET jackpot=jackpot+? WHERE id=1", (cost,))
     bot.answer_callback_query(call.id, f"✅ Куплено {qty} билетов!")
-    cb_lottery(call)
+    cb_lotto(call)
 
 
-# ── Краш ───────────────────────────────────
-
-_crash_games: dict[int, dict] = {}
-
-@bot.callback_query_handler(func=lambda c: c.data == "game_crash")
-def cb_crash_menu(call):
-    uid = call.from_user.id
-    _waiting[uid] = "game_crash"
-    bot.answer_callback_query(call.id)
-    bot.send_message(uid,
-        "<b>⚡ Краш</b>\nМножитель растёт пока не крашнется.\nУспей забрать!\n\nВведи ставку:",
-        parse_mode="HTML", reply_markup=kb([("❌ Отмена","cancel_input")]))
-
-
-@bot.message_handler(func=lambda m: m.from_user and _waiting.get(m.from_user.id) == "game_crash" and m.chat.type == "private")
-def handle_crash_bet(msg):
-    uid = msg.from_user.id
-    _waiting.pop(uid, None)
-    u = get_user(uid)
-    try:
-        bet = int(msg.text.strip())
-    except ValueError:
-        bot.send_message(uid, "❌ Введи число")
-        return
-    if bet <= 0 or bet > u["balance"]:
-        bot.send_message(uid, f"❌ Неверная ставка (баланс: {fmt(u['balance'])})")
-        return
-
-    crash_at = round(max(1.01, random.expovariate(1) + 1.0), 2)
-    add_balance(uid, -bet)
-    _crash_games[uid] = {"bet": bet, "crash": crash_at}
-
-    buttons = kb(
-        [("💰 x1.5", f"crash_take_{uid}_1.5"), ("💰 x2.0", f"crash_take_{uid}_2.0")],
-        [("💰 x3.0", f"crash_take_{uid}_3.0"), ("💰 x5.0", f"crash_take_{uid}_5.0")],
-    )
-    bot.send_message(uid,
-        f"⚡ Ставка: <b>{fmt(bet)}</b>\nМножитель растёт... Забери вовремя!",
-        parse_mode="HTML", reply_markup=buttons)
-
-
-@bot.callback_query_handler(func=lambda c: c.data.startswith("crash_take_"))
-def cb_crash_take(call):
-    parts = call.data.split("_")
-    owner = int(parts[2])
-    mult  = float(parts[3])
-    uid   = call.from_user.id
-
-    if uid != owner:
-        bot.answer_callback_query(call.id, "Это не твоя игра")
-        return
-
-    game = _crash_games.pop(uid, None)
-    if not game:
-        bot.answer_callback_query(call.id, "Игра уже завершена")
-        return
-
-    bet      = game["bet"]
-    crash_at = game["crash"]
-
-    if mult <= crash_at:
-        win = int(bet * mult)
-        add_balance(uid, win)
-        result = f"✅ Забрал x{mult}! +<b>{fmt(win)} {CURRENCY}</b>"
-    else:
-        result = f"💥 Краш на x{crash_at}! Проигрыш -{fmt(bet)} {CURRENCY}"
-
-    try:
-        bot.edit_message_text(result, uid, call.message.message_id, parse_mode="HTML",
-                              reply_markup=kb([("⚡ Ещё","game_crash"),("🎮 Игры","menu_games"),("🏠 Меню","home")]))
-    except Exception:
-        bot.send_message(uid, result, parse_mode="HTML")
-    bot.answer_callback_query(call.id)
-
-
-# ── Мины (новая игра) ──────────────────────
-
-@bot.callback_query_handler(func=lambda c: c.data == "game_mines")
-def cb_mines_menu(call):
-    _waiting[call.from_user.id] = "game_mines"
-    bot.answer_callback_query(call.id)
-    bot.send_message(call.from_user.id,
-        "<b>💣 Мины</b>\n5×5 поле, 5 мин.\nНажимай клетки — получай множитель.\nВведи ставку:",
-        parse_mode="HTML", reply_markup=kb([("❌ Отмена","cancel_input")]))
-
-_mine_games: dict[int, dict] = {}
-
-@bot.message_handler(func=lambda m: m.from_user and _waiting.get(m.from_user.id) == "game_mines" and m.chat.type == "private")
-def handle_mines_bet(msg):
-    uid = msg.from_user.id
-    _waiting.pop(uid, None)
-    u = get_user(uid)
-    try:
-        bet = int(msg.text.strip())
-    except ValueError:
-        bot.send_message(uid, "❌ Введи число")
-        return
-    if bet <= 0 or bet > u["balance"]:
-        bot.send_message(uid, f"❌ Неверная ставка (баланс: {fmt(u['balance'])})")
-        return
-
-    mines = random.sample(range(25), 5)
-    add_balance(uid, -bet)
-    _mine_games[uid] = {"bet": bet, "mines": mines, "opened": [], "mult": 1.0}
-    _send_mines_board(uid, msg.chat.id)
-
-
-def _send_mines_board(uid: int, chat_id: int):
-    game = _mine_games.get(uid)
-    if not game:
-        return
-
-    rows = []
-    for row in range(5):
-        r = []
-        for col in range(5):
-            idx = row * 5 + col
-            if idx in game["opened"]:
-                r.append((f"💎", f"mines_noop"))
-            else:
-                r.append((f"⬜", f"mines_{uid}_{idx}"))
-        rows.append(r)
-
-    rows.append([
-        (f"💰 Забрать x{game['mult']:.2f}", f"mines_cashout_{uid}"),
-    ])
-
-    bot.send_message(chat_id,
-        f"<b>💣 Мины</b>\nСтавка: <b>{fmt(game['bet'])}</b>  |  Множитель: <b>x{game['mult']:.2f}</b>\n"
-        f"Открыто: {len(game['opened'])} клеток",
-        parse_mode="HTML", reply_markup=kb(*rows))
-
-
-@bot.callback_query_handler(func=lambda c: re.match(r'^mines_\d+_\d+$', c.data))
-def cb_mines_open(call):
-    parts = call.data.split("_")
-    owner = int(parts[1])
-    idx   = int(parts[2])
-    uid   = call.from_user.id
-
-    if uid != owner:
-        bot.answer_callback_query(call.id, "Это не твоя игра")
-        return
-
-    game = _mine_games.get(uid)
-    if not game:
-        bot.answer_callback_query(call.id, "Игра не найдена")
-        return
-
-    if idx in game["mines"]:
-        _mine_games.pop(uid, None)
-        bot.answer_callback_query(call.id, "💥 МИНА!", show_alert=True)
+def _lottery_scheduler():
+    while True:
+        time.sleep(3600)
         try:
-            bot.edit_message_text(
-                f"💥 <b>Мина!</b> Проигрыш -{fmt(game['bet'])} {CURRENCY}",
-                uid, call.message.message_id, parse_mode="HTML",
-                reply_markup=kb([("💣 Ещё","game_mines"),("🎮 Игры","menu_games")]))
-        except Exception:
-            pass
-    else:
-        game["opened"].append(idx)
-        safe = 25 - 5  # всего безопасных
-        opened = len(game["opened"])
-        game["mult"] = round(1.0 + opened * (5 / safe), 2)
-        bot.answer_callback_query(call.id, f"💎 Безопасно! x{game['mult']:.2f}")
-        try:
-            bot.delete_message(uid, call.message.message_id)
-        except Exception:
-            pass
-        _send_mines_board(uid, call.message.chat.id)
-
-
-@bot.callback_query_handler(func=lambda c: c.data.startswith("mines_cashout_"))
-def cb_mines_cashout(call):
-    owner = int(call.data[14:])
-    uid   = call.from_user.id
-    if uid != owner:
-        bot.answer_callback_query(call.id, "Это не твоя игра")
-        return
-    game = _mine_games.pop(uid, None)
-    if not game:
-        bot.answer_callback_query(call.id, "Игра не найдена")
-        return
-    win = int(game["bet"] * game["mult"])
-    add_balance(uid, win)
-    bot.answer_callback_query(call.id)
-    try:
-        bot.edit_message_text(
-            f"✅ Забрал x{game['mult']:.2f}!\n+<b>{fmt(win)} {CURRENCY}</b>",
-            uid, call.message.message_id, parse_mode="HTML",
-            reply_markup=kb([("💣 Ещё","game_mines"),("🎮 Игры","menu_games"),("🏠 Меню","home")]))
-    except Exception:
-        bot.send_message(uid, f"✅ Выигрыш: {fmt(win)} {CURRENCY}", parse_mode="HTML")
-
-
-@bot.callback_query_handler(func=lambda c: c.data == "mines_noop")
-def cb_mines_noop(call):
-    bot.answer_callback_query(call.id)
+            with db() as c:
+                c.execute("SELECT jackpot, draw_at FROM lottery WHERE id=1")
+                lotto = c.fetchone()
+            if not lotto or lotto["draw_at"] > now(): continue
+            with db() as c:
+                c.execute("SELECT user_id, tickets FROM lottery_tickets WHERE tickets > 0")
+                participants = c.fetchall()
+            if not participants:
+                with db() as c:
+                    c.execute("UPDATE lottery SET draw_at=? WHERE id=1", (now() + 86400,))
+                continue
+            pool   = [p["user_id"] for p in participants for _ in range(p["tickets"])]
+            winner = random.choice(pool)
+            jackpot = lotto["jackpot"]
+            add_balance(winner, jackpot)
+            with db() as c:
+                c.execute("UPDATE lottery SET jackpot=0, draw_at=? WHERE id=1",
+                          (now() + 86400,))
+                c.execute("DELETE FROM lottery_tickets")
+                c.execute("SELECT name FROM users WHERE id=?", (winner,))
+                name = (c.fetchone() or {}).get("name", f"#{winner}")
+            send_alert(f"🏆 <b>Лотерея!</b> {name} выиграл <b>{fmt(jackpot)} {CUR}</b>")
+            try:
+                bot.send_message(winner,
+                    f"🎉 <b>Вы выиграли лотерею!</b>\n+{fmt(jackpot)} {CUR}",
+                    parse_mode="HTML")
+            except Exception: pass
+        except Exception as e:
+            print(f"[lottery] err: {e}")
 
 
 # ══════════════════════════════════════════════
-# 16. МАГАЗИН
+# 17. МАГАЗИН
 # ══════════════════════════════════════════════
 
 @bot.callback_query_handler(func=lambda c: c.data == "menu_shop")
 def cb_shop(call):
     uid = call.from_user.id
     with db() as c:
-        c.execute("SELECT * FROM items WHERE active=1 ORDER BY price")
+        c.execute("SELECT id,emoji,name,desc,price,supply,sold FROM items WHERE active=1 ORDER BY price")
         items = c.fetchall()
 
     if not items:
-        text = "<b>🛍️ Магазин</b>\n\nПусто."
-        try:
-            bot.edit_message_text(text, uid, call.message.message_id,
-                                  reply_markup=kb([("🏠 Меню","home")]), parse_mode="HTML")
-        except Exception:
-            bot.send_message(uid, text, reply_markup=kb([("🏠 Меню","home")]), parse_mode="HTML")
-        bot.answer_callback_query(call.id)
-        return
+        _edit(call, "🛍️ <b>Магазин пуст</b>", kb([("🏠 Меню","home")])); return
 
-    text = "<b>🛍️ Магазин</b>\n━━━━━━━━━━━━━━━━━━\n"
-    rows = []
-    for item in items:
-        avail = "∞" if item["supply"] == -1 else str(item["supply"] - item["sold"])
-        text += f"{item['emoji']} <b>{item['name']}</b> — {fmt(item['price'])} {CURRENCY} [{avail}]\n"
-        rows.append([(f"🛒 {item['emoji']} {item['name']}", f"buy_item_{item['id']}")])
-    rows.append([("🏠 Меню","home")])
+    lines = []
+    rows  = []
+    for it in items:
+        left = f" ({it['supply']-it['sold']}шт.)" if it["supply"] != -1 else ""
+        lines.append(f"{it['emoji']} <b>{it['name']}</b> — {fmt(it['price'])} {CUR}{left}\n"
+                     f"   <i>{it['desc']}</i>")
+        rows.append([(f"{it['emoji']} Купить", f"buy_item_{it['id']}")])
 
-    try:
-        bot.edit_message_text(text, uid, call.message.message_id,
-                              reply_markup=kb(*rows), parse_mode="HTML")
-    except Exception:
-        bot.send_message(uid, text, reply_markup=kb(*rows), parse_mode="HTML")
-    bot.answer_callback_query(call.id)
+    rows.append([("🎒 Инвентарь", "menu_inv"), ("🏠 Меню", "home")])
+    _edit(call, "🛍️ <b>Магазин</b>\n━━━━━━━━━━━━━━━━━━\n" + "\n".join(lines),
+          kb(*rows))
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("buy_item_"))
 def cb_buy_item(call):
     uid     = call.from_user.id
     item_id = int(call.data[9:])
-
     with db() as c:
-        c.execute("SELECT * FROM items WHERE id=%s AND active=1", (item_id,))
-        item = c.fetchone()
-
-    if not item:
-        bot.answer_callback_query(call.id, "❌ Товар недоступен", show_alert=True)
-        return
-    if item["supply"] != -1 and item["sold"] >= item["supply"]:
-        bot.answer_callback_query(call.id, "❌ Товар распродан", show_alert=True)
-        return
-
+        c.execute("SELECT * FROM items WHERE id=? AND active=1", (item_id,))
+        it = c.fetchone()
+    if not it:
+        bot.answer_callback_query(call.id, "❌ Недоступно", show_alert=True); return
+    if it["supply"] != -1 and it["sold"] >= it["supply"]:
+        bot.answer_callback_query(call.id, "❌ Распродано", show_alert=True); return
     u = get_user(uid)
-    if u["balance"] < item["price"]:
+    if u["balance"] < it["price"]:
         bot.answer_callback_query(call.id,
-            f"❌ Нужно {fmt(item['price'])}, у тебя {fmt(u['balance'])}", show_alert=True)
-        return
-
-    add_balance(uid, -item["price"])
+            f"❌ Нужно {fmt(it['price'])}, есть {fmt(u['balance'])}", show_alert=True); return
+    add_balance(uid, -it["price"])
     with db() as c:
-        c.execute("""INSERT INTO inventory (user_id, item_id, qty) VALUES (%s, %s, 1)
-                     ON CONFLICT (user_id, item_id) DO UPDATE SET qty = inventory.qty + 1""",
-                  (uid, item_id))
-        if item["supply"] != -1:
-            c.execute("UPDATE items SET sold=sold+1 WHERE id=%s", (item_id,))
+        c.execute("INSERT INTO inventory (user_id,item_id,qty) VALUES (?,?,1) "
+                  "ON CONFLICT(user_id,item_id) DO UPDATE SET qty=qty+1", (uid, item_id))
+        if it["supply"] != -1:
+            c.execute("UPDATE items SET sold=sold+1 WHERE id=?", (item_id,))
 
-    bot.answer_callback_query(call.id, f"✅ Куплено: {item['emoji']} {item['name']}")
+    # Применяем бустер клика мгновенно
+    if "click_boost" in (it["effect"] or ""):
+        try:
+            duration = int(it["effect"].split("_")[-1])
+            with db() as c:
+                c.execute("UPDATE users SET click_power=click_power*2 WHERE id=?", (uid,))
+            def _reset():
+                time.sleep(duration)
+                with db() as c:
+                    c.execute("UPDATE users SET click_power=click_power//2 WHERE id=?", (uid,))
+            threading.Thread(target=_reset, daemon=True).start()
+        except Exception: pass
+
+    bot.answer_callback_query(call.id, f"✅ {it['emoji']} {it['name']} куплено!")
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "menu_inv")
+def cb_inventory(call):
+    uid = call.from_user.id
+    with db() as c:
+        c.execute("""SELECT it.emoji, it.name, it.desc, inv.qty
+                     FROM inventory inv JOIN items it ON it.id=inv.item_id
+                     WHERE inv.user_id=? AND inv.qty>0""", (uid,))
+        inv = c.fetchall()
+    if not inv:
+        _edit(call, "🎒 <b>Инвентарь пуст</b>",
+              kb([("🛍️ Магазин", "menu_shop"), ("🏠 Меню", "home")])); return
+    lines = [f"{r['emoji']} <b>{r['name']}</b> ×{r['qty']}\n   <i>{r['desc']}</i>" for r in inv]
+    _edit(call, "🎒 <b>Инвентарь</b>\n━━━━━━━━━━━━━━━━━━\n" + "\n".join(lines),
+          kb([("🛍️ Магазин", "menu_shop"), ("🏠 Меню", "home")]))
 
 
 # ══════════════════════════════════════════════
-# 17. ТОП
+# 18. ТОП
 # ══════════════════════════════════════════════
 
 @bot.callback_query_handler(func=lambda c: c.data == "menu_top")
 def cb_top(call):
-    uid = call.from_user.id
-    buttons = kb(
-        [("💵 По балансу","top_balance"), ("⭐ По XP","top_xp")],
-        [("📈 Акционеры","top_stocks"),   ("🏠 Меню","home")]
-    )
-    try:
-        bot.edit_message_text("<b>🏆 Рейтинги</b>", uid, call.message.message_id,
-                              reply_markup=buttons, parse_mode="HTML")
-    except Exception:
-        bot.send_message(uid, "<b>🏆 Рейтинги</b>", reply_markup=buttons, parse_mode="HTML")
-    bot.answer_callback_query(call.id)
+    _edit(call, "<b>🏆 Рейтинги</b>", kb(
+        [("💎 Баланс", "top_balance"), ("⭐ XP",    "top_xp")],
+        [("📈 Акции",  "top_stocks"),  ("🏠 Меню", "home")],
+    ))
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("top_"))
-def cb_top_category(call):
+def cb_top_cat(call):
     uid     = call.from_user.id
     cat     = call.data[4:]
     medals  = ["🥇","🥈","🥉","4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣","🔟"]
@@ -1791,40 +2222,27 @@ def cb_top_category(call):
         if cat == "balance":
             c.execute("SELECT name, balance FROM users ORDER BY balance DESC LIMIT 10")
             rows = c.fetchall()
-            title  = "💵 Топ по балансу"
-            val_fn = lambda r: fmt(r["balance"])
+            title, vf = "💎 Топ по балансу", lambda r: fmt(r["balance"])
         elif cat == "xp":
             c.execute("SELECT name, xp FROM users ORDER BY xp DESC LIMIT 10")
             rows = c.fetchall()
-            title  = "⭐ Топ по XP"
-            val_fn = lambda r: fmt(r["xp"])
+            title, vf = "⭐ Топ по XP", lambda r: fmt(r["xp"])
         elif cat == "stocks":
-            c.execute("""SELECT u.name, SUM(p.shares) AS total
-                         FROM portfolios p JOIN users u ON u.id=p.user_id
-                         WHERE p.ticker=%s GROUP BY u.name ORDER BY total DESC LIMIT 10""", (TICKER,))
+            c.execute("""SELECT u.name, SUM(p.shares) as s FROM portfolios p
+                         JOIN users u ON u.id=p.user_id WHERE p.ticker=?
+                         GROUP BY p.user_id ORDER BY s DESC LIMIT 10""", (TICKER,))
             rows = c.fetchall()
-            title  = "📈 Топ акционеров"
-            val_fn = lambda r: f"{r['total']} акций"
+            title, vf = "📈 Акционеры", lambda r: f"{r['s']} акций"
         else:
-            bot.answer_callback_query(call.id)
-            return
+            bot.answer_callback_query(call.id); return
 
-    lines = [f"{medals[i]} {r['name'] or 'Игрок'} — <b>{val_fn(r)}</b>"
-             for i, r in enumerate(rows)]
-    text = f"<b>{title}</b>\n━━━━━━━━━━━━━━━━━━\n" + "\n".join(lines) if lines else f"<b>{title}</b>\n\nПусто"
-
-    try:
-        bot.edit_message_text(text, uid, call.message.message_id,
-                              reply_markup=kb([("🏆 Топ","menu_top"),("🏠 Меню","home")]),
-                              parse_mode="HTML")
-    except Exception:
-        bot.send_message(uid, text, parse_mode="HTML",
-                         reply_markup=kb([("🏆 Топ","menu_top"),("🏠 Меню","home")]))
-    bot.answer_callback_query(call.id)
+    lines = [f"{medals[i]} <b>{r['name'] or 'Игрок'}</b> — {vf(r)}" for i, r in enumerate(rows)]
+    text  = f"<b>{title}</b>\n━━━━━━━━━━━━━━━━━━\n" + ("\n".join(lines) if lines else "Пусто")
+    _edit(call, text, kb([("🏆 Топ", "menu_top"), ("🏠 Меню", "home")]))
 
 
 # ══════════════════════════════════════════════
-# 18. КЛАН
+# 19. КЛАН
 # ══════════════════════════════════════════════
 
 @bot.callback_query_handler(func=lambda c: c.data == "menu_clan")
@@ -1832,115 +2250,150 @@ def cb_clan(call):
     uid = call.from_user.id
     with db() as c:
         c.execute("""SELECT cl.*, cm.role FROM clan_members cm
-                     JOIN clans cl ON cl.id=cm.clan_id WHERE cm.user_id=%s""", (uid,))
+                     JOIN clans cl ON cl.id=cm.clan_id WHERE cm.user_id=?""", (uid,))
         clan = c.fetchone()
 
     if not clan:
-        text = (
-            "<b>🏰 Клан</b>\n━━━━━━━━━━━━━━━━━━\n"
-            "Ты не состоишь в клане.\n\nСоздай или вступи в клан!"
-        )
-        buttons = kb([("⚔️ Создать клан","clan_create")], [("🏠 Меню","home")])
-    else:
-        with db() as c:
-            c.execute("SELECT COUNT(*) AS cnt FROM clan_members WHERE clan_id=%s", (clan["id"],))
-            members = c.fetchone()["cnt"]
-
-        text = (
-            f"<b>🏰 {clan['name']}</b> [{clan['tag']}]\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"Уровень: <b>{clan['level']}</b>\n"
-            f"Казна: <b>{fmt(clan['balance'])} {CURRENCY}</b>\n"
-            f"Участников: <b>{members}</b>\n"
-            f"Ваша роль: <b>{clan['role']}</b>"
-        )
-        rows = [[("👥 Участники", f"clan_members_{clan['id']}"),
-                 ("💰 Взнос",     f"clan_donate_{clan['id']}")]]
-        if clan["role"] in ("owner","admin"):
-            rows.append([("⚙️ Управление", f"clan_manage_{clan['id']}")])
-        rows.append([("🚪 Покинуть", f"clan_leave_{clan['id']}"), ("🏠 Меню","home")])
-        buttons = kb(*rows)
-
-    try:
-        bot.edit_message_text(text, uid, call.message.message_id,
-                              reply_markup=buttons, parse_mode="HTML")
-    except Exception:
-        bot.send_message(uid, text, reply_markup=buttons, parse_mode="HTML")
-    bot.answer_callback_query(call.id)
-
-
-@bot.callback_query_handler(func=lambda c: c.data == "clan_create")
-def cb_clan_create(call):
-    _waiting[call.from_user.id] = "clan_create"
-    bot.answer_callback_query(call.id)
-    bot.send_message(call.from_user.id,
-        f"Введи название и тег клана через пробел:\nПример: <code>Легион LEG</code>\nСтоимость: <b>5 000 {CURRENCY}</b>",
-        parse_mode="HTML", reply_markup=kb([("❌ Отмена","cancel_input")]))
-
-
-@bot.message_handler(func=lambda m: m.from_user and _waiting.get(m.from_user.id) == "clan_create" and m.chat.type == "private")
-def handle_clan_create(msg):
-    uid = msg.from_user.id
-    _waiting.pop(uid, None)
-    parts = msg.text.strip().split()
-    if len(parts) < 2:
-        bot.send_message(uid, "❌ Формат: Название ТЕГ")
+        _edit(call,
+            "<b>🏰 Клан</b>\n━━━━━━━━━━━━━━━━━━\nТы не в клане.",
+            kb([("⚔️ Создать", "clan_create_act"), ("🏠 Меню", "home")]))
         return
+
+    with db() as c:
+        c.execute("SELECT COUNT(*) as cnt FROM clan_members WHERE clan_id=?", (clan["id"],))
+        members = c.fetchone()["cnt"]
+
+    text = (
+        f"<b>🏰 {clan['name']}</b>  [{clan['tag']}]\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"Уровень: <b>{clan['level']}</b>  XP: {fmt(clan['xp'])}\n"
+        f"Казна: <b>{fmt(clan['balance'])} {CUR}</b>\n"
+        f"Участников: <b>{members}</b>\n"
+        f"Ваша роль: <b>{clan['role']}</b>"
+    )
+    rows = [[("👥 Участники", f"clan_mem_{clan['id']}"),
+             ("💰 Взнос",    "clan_donate")]]
+    if clan["role"] in ("owner", "admin"):
+        rows.append([("⚙️ Управление", f"clan_manage_{clan['id']}")])
+    rows.append([("🚪 Покинуть", f"clan_leave_{clan['id']}"), ("🏠 Меню", "home")])
+    _edit(call, text, kb(*rows))
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "clan_create_act")
+def cb_clan_create_act(call):
+    uid = call.from_user.id
+    _waiting[uid] = "clan_create"
+    bot.answer_callback_query(call.id)
+    bot.send_message(uid,
+        f"⚔️ Введи: <b>Название ТЕГ</b>\nПример: Легион LEG\n"
+        f"Стоимость: <b>{fmt(CLAN_COST)} {CUR}</b>",
+        parse_mode="HTML",
+        reply_markup=kb([("❌ Отмена", "cancel_input")]))
+
+
+def _do_clan_create(uid: int, text: str):
+    parts = text.strip().split()
+    if len(parts) < 2:
+        bot.send_message(uid, "❌ Формат: Название ТЕГ"); return
     tag  = parts[-1].upper()[:5]
     name = " ".join(parts[:-1])[:30]
-    cost = 5_000
-    u = get_user(uid)
-    if u["balance"] < cost:
-        bot.send_message(uid, f"❌ Нужно {fmt(cost)} {CURRENCY}")
-        return
-    try:
-        add_balance(uid, -cost)
-        with db() as c:
-            c.execute("INSERT INTO clans (name,tag,owner,created_at) VALUES (%s,%s,%s,%s)",
-                      (name, tag, uid, now()))
-            c.execute("SELECT id FROM clans WHERE tag=%s", (tag,))
-            clan_id = c.fetchone()["id"]
-            c.execute("INSERT INTO clan_members (user_id,clan_id,role,joined_at) VALUES (%s,%s,%s,%s)",
-                      (uid, clan_id, "owner", now()))
-        bot.send_message(uid, f"✅ Клан <b>{name}</b> [{tag}] создан!", parse_mode="HTML",
-                         reply_markup=kb([("🏰 Клан","menu_clan"),("🏠 Меню","home")]))
-    except Exception:
-        bot.send_message(uid, "❌ Название или тег уже заняты")
-        add_balance(uid, cost)
-
-
-@bot.callback_query_handler(func=lambda c: c.data.startswith("clan_leave_"))
-def cb_clan_leave(call):
-    uid     = call.from_user.id
-    clan_id = int(call.data[11:])
+    u    = get_user(uid)
+    if u["balance"] < CLAN_COST:
+        bot.send_message(uid, f"❌ Нужно {fmt(CLAN_COST)} {CUR}"); return
+    # Проверяем — уже в клане?
     with db() as c:
-        c.execute("SELECT role FROM clan_members WHERE user_id=%s AND clan_id=%s", (uid, clan_id))
+        c.execute("SELECT 1 FROM clan_members WHERE user_id=?", (uid,))
+        if c.fetchone():
+            bot.send_message(uid, "❌ Вы уже в клане"); return
+    try:
+        add_balance(uid, -CLAN_COST)
+        with db() as c:
+            c.execute("INSERT INTO clans (name,tag,owner,created_at) VALUES (?,?,?,?)",
+                      (name, tag, uid, now()))
+            cid = c.lastrowid
+            c.execute("INSERT INTO clan_members (user_id,clan_id,role,joined_at) VALUES (?,?,?,?)",
+                      (uid, cid, "owner", now()))
+        grant_achievement(uid, "clan_owner")
+        bot.send_message(uid, f"✅ Клан <b>{name}</b> [{tag}] создан!",
+                         parse_mode="HTML",
+                         reply_markup=kb([("🏰 Клан", "menu_clan"), ("🏠 Меню", "home")]))
+    except Exception:
+        add_balance(uid, CLAN_COST)
+        bot.send_message(uid, "❌ Название или тег уже заняты")
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "clan_donate")
+def cb_clan_donate_menu(call):
+    uid = call.from_user.id
+    _waiting[uid] = "clan_donate"
+    bot.answer_callback_query(call.id)
+    bot.send_message(uid, f"💰 Введи сумму взноса в казну:",
+                     reply_markup=kb([("❌ Отмена", "cancel_input")]))
+
+
+def _do_clan_donate(uid: int, amount: int):
+    u = get_user(uid)
+    if u["balance"] < amount:
+        bot.send_message(uid, "❌ Недостаточно"); return
+    with db() as c:
+        c.execute("SELECT clan_id FROM clan_members WHERE user_id=?", (uid,))
+        row = c.fetchone()
+    if not row:
+        bot.send_message(uid, "❌ Вы не в клане"); return
+    cid = row["clan_id"]
+    add_balance(uid, -amount)
+    with db() as c:
+        c.execute("UPDATE clans SET balance=balance+?, xp=xp+? WHERE id=?",
+                  (amount, amount // 100, cid))
+    bot.send_message(uid, f"✅ Внесено в казну: <b>{fmt(amount)} {CUR}</b>",
+                     parse_mode="HTML",
+                     reply_markup=kb([("🏰 Клан", "menu_clan"), ("🏠 Меню", "home")]))
+
+
+@bot.callback_query_handler(func=lambda c: re.match(r"^clan_mem_\d+$", c.data))
+def cb_clan_members(call):
+    cid = int(call.data[9:])
+    with db() as c:
+        c.execute("""SELECT u.name, cm.role FROM clan_members cm
+                     JOIN users u ON u.id=cm.user_id WHERE cm.clan_id=?""", (cid,))
+        members = c.fetchall()
+    lines = [f"{'👑' if r['role']=='owner' else '⭐' if r['role']=='admin' else '•'} "
+             f"<b>{r['name'] or 'Игрок'}</b>  {r['role']}" for r in members]
+    _edit(call, f"<b>👥 Участники</b>\n━━━━━━━━━━━━━━━━━━\n" + "\n".join(lines),
+          kb([("🏰 Клан", "menu_clan"), ("🏠 Меню", "home")]))
+
+
+@bot.callback_query_handler(func=lambda c: re.match(r"^clan_leave_\d+$", c.data))
+def cb_clan_leave(call):
+    uid = call.from_user.id
+    cid = int(call.data[11:])
+    with db() as c:
+        c.execute("SELECT role FROM clan_members WHERE user_id=? AND clan_id=?", (uid, cid))
         row = c.fetchone()
     if row and row["role"] == "owner":
-        bot.answer_callback_query(call.id, "❌ Владелец не может покинуть клан. Передай права.", show_alert=True)
-        return
+        bot.answer_callback_query(call.id, "❌ Передай права прежде чем покинуть", show_alert=True); return
     with db() as c:
-        c.execute("DELETE FROM clan_members WHERE user_id=%s", (uid,))
-    bot.answer_callback_query(call.id, "✅ Вы покинули клан")
+        c.execute("DELETE FROM clan_members WHERE user_id=?", (uid,))
+    bot.answer_callback_query(call.id, "✅ Вышли из клана")
     cb_clan(call)
 
 
 # ══════════════════════════════════════════════
-# 19. ДОНАТ (Telegram Stars)
+# 20. ДОНАТ
 # ══════════════════════════════════════════════
 
-@bot.message_handler(func=lambda m: m.text and m.text.lower().strip() == "донат")
-def cmd_donate(msg):
-    uid = msg.from_user.id
-    ensure_user(uid, msg.from_user.first_name or "")
+@bot.callback_query_handler(func=lambda c: c.data == "menu_donate")
+def cb_donate_menu(call):
+    uid = call.from_user.id
     with db() as c:
-        c.execute("SELECT key, stars, amount, label FROM donate_packages ORDER BY stars")
+        c.execute("SELECT key,stars,amount,label FROM donate_packages ORDER BY stars")
         pkgs = c.fetchall()
-
-    text = "<b>💎 Донат</b>\n━━━━━━━━━━━━━━━━━━\nПополни баланс через Telegram Stars:"
     rows = [[(p["label"], f"donate_{p['key']}")] for p in pkgs]
-    rows.append([("🏠 Меню","home")])
-    bot.send_message(uid, text, reply_markup=kb(*rows), parse_mode="HTML")
+    rows.append([("🏠 Меню", "home")])
+    _edit(call,
+        f"<b>💎 Донат</b>\n━━━━━━━━━━━━━━━━━━\n"
+        f"Пополни баланс через Telegram Stars:",
+        kb(*rows))
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("donate_"))
@@ -1948,19 +2401,18 @@ def cb_donate(call):
     uid = call.from_user.id
     key = call.data[7:]
     with db() as c:
-        c.execute("SELECT * FROM donate_packages WHERE key=%s", (key,))
+        c.execute("SELECT * FROM donate_packages WHERE key=?", (key,))
         pkg = c.fetchone()
     if not pkg:
-        bot.answer_callback_query(call.id, "❌ Пакет не найден")
-        return
+        bot.answer_callback_query(call.id, "❌ Не найдено"); return
     bot.answer_callback_query(call.id)
     bot.send_invoice(uid,
         title=f"Пополнение {pkg['label']}",
-        description=f"+{fmt(pkg['amount'])} {CURRENCY}",
+        description=f"+{fmt(pkg['amount'])} {CUR}",
         payload=f"donate_{key}",
         provider_token="",
         currency="XTR",
-        prices=[LabeledPrice(f"{pkg['label']}", pkg["stars"])])
+        prices=[LabeledPrice(pkg["label"], pkg["stars"])])
 
 
 @bot.pre_checkout_query_handler(func=lambda q: True)
@@ -1969,322 +2421,116 @@ def pre_checkout(query):
 
 
 @bot.message_handler(content_types=["successful_payment"])
-def successful_payment(msg):
+def on_payment(msg):
     uid     = msg.from_user.id
     payload = msg.successful_payment.invoice_payload
     key     = payload[7:]
     with db() as c:
-        c.execute("SELECT amount FROM donate_packages WHERE key=%s", (key,))
+        c.execute("SELECT amount FROM donate_packages WHERE key=?", (key,))
         pkg = c.fetchone()
     if pkg:
         add_balance(uid, pkg["amount"])
+        # premium 30 дней за покупку ≥50⭐
+        with db() as c:
+            c.execute("SELECT stars FROM donate_packages WHERE key=?", (key,))
+            stars = (c.fetchone() or {}).get("stars", 0)
+        if stars >= 50:
+            until = now() + 30 * 86400
+            with db() as c:
+                c.execute("UPDATE users SET premium_until=MAX(premium_until,?) WHERE id=?",
+                          (until, uid))
         bot.send_message(uid,
-            f"✅ <b>Пополнение прошло!</b>\n+{fmt(pkg['amount'])} {CURRENCY}",
-            parse_mode="HTML", reply_markup=kb([("🏠 Меню","home")]))
-        send_alert(f"💎 Донат: uid={uid} +{fmt(pkg['amount'])}")
-
-
-# ══════════════════════════════════════════════
-# 20. ПРОМОКОД
-# ══════════════════════════════════════════════
-
-@bot.message_handler(func=lambda m: m.text and m.text.lower().startswith("промо "))
-def cmd_promo(msg):
-    uid  = msg.from_user.id
-    code = msg.text.strip().split(None, 1)[1].strip().upper()
-    ensure_user(uid, msg.from_user.first_name or "")
-
-    with db() as c:
-        c.execute("SELECT * FROM promo_codes WHERE code=%s AND active=1", (code,))
-        promo = c.fetchone()
-
-    if not promo:
-        bot.send_message(uid, "❌ Промокод не найден")
-        return
-    if promo["expires"] and promo["expires"] < now():
-        bot.send_message(uid, "❌ Промокод истёк")
-        return
-    if promo["max_uses"] > 0 and promo["uses"] >= promo["max_uses"]:
-        bot.send_message(uid, "❌ Промокод исчерпан")
-        return
-
-    with db() as c:
-        try:
-            c.execute("INSERT INTO promo_uses (user_id,code,ts) VALUES (%s,%s,%s)",
-                      (uid, code, now()))
-        except Exception:
-            bot.send_message(uid, "❌ Этот промокод ты уже использовал")
-            return
-        c.execute("UPDATE promo_codes SET uses=uses+1 WHERE code=%s", (code,))
-
-    add_balance(uid, promo["reward"])
-    bot.send_message(uid, f"✅ Промокод активирован!\n+<b>{fmt(promo['reward'])} {CURRENCY}</b>",
-                     parse_mode="HTML", reply_markup=kb([("🏠 Меню","home")]))
+            f"✅ <b>Оплачено!</b> +{fmt(pkg['amount'])} {CUR}",
+            parse_mode="HTML",
+            reply_markup=kb([("🏠 Меню", "home")]))
+        send_alert(f"💎 Донат uid={uid} key={key} +{fmt(pkg['amount'])}")
 
 
 # ══════════════════════════════════════════════
 # 21. РЕФЕРАЛЬНАЯ ССЫЛКА
 # ══════════════════════════════════════════════
 
-@bot.message_handler(func=lambda m: m.text and m.text.lower().strip() in ["реферал","рефка","ref"])
-def cmd_referral(msg):
-    uid = msg.from_user.id
-    ensure_user(uid, msg.from_user.first_name or "")
-
-    with db() as c:
-        c.execute("SELECT ref_code FROM users WHERE id=%s", (uid,))
-        row = c.fetchone()
-
-    ref_code = row["ref_code"] if row and row["ref_code"] else None
-    if not ref_code:
-        ref_code = f"R{uid}"
-        with db() as c:
-            c.execute("UPDATE users SET ref_code=%s WHERE id=%s", (ref_code, uid))
-
-    with db() as c:
-        c.execute("SELECT COUNT(*) AS cnt FROM users WHERE ref_by=%s", (uid,))
-        referrals = c.fetchone()["cnt"]
-
-    bot_info = bot.get_me()
-    link = f"https://t.me/{bot_info.username}?start={ref_code}"
-
-    bot.send_message(uid,
+@bot.callback_query_handler(func=lambda c: c.data == "act_reflink")
+def cb_reflink(call):
+    uid = call.from_user.id
+    u   = get_user(uid)
+    ref_code = u.get("ref_code") or f"R{uid}"
+    bi = bot.get_me()
+    link = f"https://t.me/{bi.username}?start={ref_code}"
+    text = (
         f"<b>🔗 Реферальная программа</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"Ты пригласил: <b>{referrals}</b> игроков\n"
-        f"Бонус за приглашение: <b>2 000 {CURRENCY}</b> тебе и другу\n\n"
-        f"Твоя ссылка:\n{link}",
-        parse_mode="HTML", reply_markup=kb([("🏠 Меню","home")]))
+        f"Приглашено: <b>{u['ref_count']}</b> игроков\n"
+        f"Бонус: <b>3 000 {CUR}</b> тебе и другу\n\n"
+        f"{link}"
+    )
+    _edit(call, text, kb([("🏠 Меню", "home")]))
 
 
 # ══════════════════════════════════════════════
-# 22. ПЕРЕВОД (текстовая команда)
+# 22. ПОМОЩЬ
 # ══════════════════════════════════════════════
 
-@bot.message_handler(func=lambda m: m.text and m.text.lower().split()[0] in ["перевод","дать","pay"] if m.text else False)
-def cmd_transfer(msg):
-    if is_group(msg):
-        return  # в группе обрабатывается отдельным хендлером
-    uid = msg.from_user.id
-    _waiting[uid] = "action_transfer"
-    bot.send_message(uid,
-        f"Введи: @username сумма\nПример: @ivan 5000\n\nКомиссия: {TRANSFER_FEE*100:.0f}%",
-        reply_markup=kb([("❌ Отмена","cancel_input")]))
-
-
-# ══════════════════════════════════════════════
-# 23. ЛОТЕРЕЯ — ПЛАНИРОВЩИК
-# ══════════════════════════════════════════════
-
-def _lottery_scheduler():
-    print("[lottery] планировщик запущен")
-    while True:
-        time.sleep(60)
-        try:
-            with db() as c:
-                c.execute("SELECT jackpot, draw_at FROM lottery WHERE id=1")
-                lotto = c.fetchone()
-            if not lotto or lotto["draw_at"] == 0:
-                # Устанавливаем следующий розыгрыш через 24ч
-                with db() as c:
-                    c.execute("UPDATE lottery SET draw_at=%s WHERE id=1", (now() + 86400,))
-                continue
-            if lotto["draw_at"] > now():
-                continue
-            if lotto["jackpot"] == 0:
-                with db() as c:
-                    c.execute("UPDATE lottery SET draw_at=%s WHERE id=1", (now() + 86400,))
-                continue
-
-            with db() as c:
-                c.execute("SELECT user_id, tickets FROM lottery_tickets WHERE tickets > 0")
-                participants = c.fetchall()
-
-            if not participants:
-                with db() as c:
-                    c.execute("UPDATE lottery SET draw_at=%s WHERE id=1", (now() + 86400,))
-                continue
-
-            pool_list = []
-            for p in participants:
-                pool_list.extend([p["user_id"]] * p["tickets"])
-
-            winner = random.choice(pool_list)
-            jackpot = lotto["jackpot"]
-            add_balance(winner, jackpot)
-
-            with db() as c:
-                c.execute("DELETE FROM lottery_tickets")
-                c.execute("UPDATE lottery SET jackpot=0, draw_at=%s WHERE id=1", (now() + 86400,))
-
-            send_alert(f"🏆 Лотерея! Победитель uid={winner} +{fmt(jackpot)} {CURRENCY}")
-            try:
-                bot.send_message(winner,
-                    f"🎉 Вы выиграли лотерею!\n+<b>{fmt(jackpot)} {CURRENCY}</b>",
-                    parse_mode="HTML")
-            except Exception:
-                pass
-        except Exception as e:
-            print(f"[lottery] ошибка: {e}")
+@bot.callback_query_handler(func=lambda c: c.data == "menu_help")
+def cb_help(call):
+    text = (
+        "<b>❓ Помощь</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "<b>ЛС-команды:</b>\n"
+        "клик — кликер\n"
+        "майнинг — сбор руды\n"
+        "меню — главное меню\n\n"
+        "<b>Группа:</b>\n"
+        "баланс · топ · акции\n"
+        "рул красное 1000 · кости 500\n"
+        "слот 1000 · краш 500\n"
+        "дуэль 1000 · кнб 500 (reply)\n"
+        "дать @user 500 · чек 5000\n"
+        "лот 3 · промо КОД\n\n"
+        "<b>Меню → Игры:</b>\n"
+        "Кубик · Слоты · Рулетка\n"
+        "Краш · Мины · Башня · Лотерея"
+    )
+    _edit(call, text, kb([("🏠 Меню", "home")]))
 
 
 # ══════════════════════════════════════════════
-# 24. АДМИН-КОМАНДЫ
+# 23. ГРУППОВЫЕ КОМАНДЫ
 # ══════════════════════════════════════════════
 
-def admin_only(fn):
-    def wrapper(msg):
-        if not is_admin(msg.from_user.id):
-            return
-        fn(msg)
-    return wrapper
+GROUP_TYPES = {"group","supergroup"}
+
+def is_group(msg) -> bool:
+    return msg.chat.type in GROUP_TYPES
+
+def gname(msg) -> str:
+    u = msg.from_user
+    return u.first_name or u.username or str(u.id)
 
 
-@bot.message_handler(func=lambda m: m.text and m.text.lower().startswith("выдать ") and is_admin(m.from_user.id))
-@admin_only
-def cmd_give(msg):
-    parts = msg.text.split()
-    try:
-        uid_ = int(parts[1])
-        amt  = int(parts[2])
-    except (IndexError, ValueError):
-        bot.reply_to(msg, "Формат: выдать <uid> <сумма>")
-        return
-    add_balance(uid_, amt)
-    bot.reply_to(msg, f"✅ Выдано {fmt(amt)} {CURRENCY} игроку {uid_}")
-
-
-@bot.message_handler(func=lambda m: m.text and m.text.lower().startswith("забрать ") and is_admin(m.from_user.id))
-@admin_only
-def cmd_take(msg):
-    parts = msg.text.split()
-    try:
-        uid_ = int(parts[1])
-        amt  = int(parts[2])
-    except (IndexError, ValueError):
-        bot.reply_to(msg, "Формат: забрать <uid> <сумма>")
-        return
-    add_balance(uid_, -amt)
-    bot.reply_to(msg, f"✅ Забрано {fmt(amt)} {CURRENCY} у игрока {uid_}")
-
-
-@bot.message_handler(func=lambda m: m.text and m.text.lower().startswith("бан ") and is_admin(m.from_user.id))
-@admin_only
-def cmd_ban(msg):
-    parts = msg.text.split(None, 2)
-    try:
-        uid_ = int(parts[1])
-    except (IndexError, ValueError):
-        bot.reply_to(msg, "Формат: бан <uid> [причина]")
-        return
-    reason = parts[2] if len(parts) > 2 else "Нарушение правил"
-    with db() as c:
-        c.execute("INSERT INTO bans (user_id,reason,by,ts) VALUES (%s,%s,%s,%s) ON CONFLICT (user_id) DO UPDATE SET reason=%s",
-                  (uid_, reason, msg.from_user.id, now(), reason))
-    bot.reply_to(msg, f"🚫 Игрок {uid_} заблокирован.")
-    try:
-        bot.send_message(uid_, f"🚫 Вы заблокированы.\nПричина: {reason}")
-    except Exception:
-        pass
-
-
-@bot.message_handler(func=lambda m: m.text and m.text.lower().startswith("разбан ") and is_admin(m.from_user.id))
-@admin_only
-def cmd_unban(msg):
-    parts = msg.text.split()
-    try:
-        uid_ = int(parts[1])
-    except (IndexError, ValueError):
-        bot.reply_to(msg, "Формат: разбан <uid>")
-        return
-    with db() as c:
-        c.execute("DELETE FROM bans WHERE user_id=%s", (uid_,))
-    bot.reply_to(msg, f"✅ Игрок {uid_} разблокирован.")
-
-
-@bot.message_handler(func=lambda m: m.text and m.text.lower().startswith("промо создать ") and is_admin(m.from_user.id))
-@admin_only
-def cmd_create_promo(msg):
-    parts = msg.text.split()
-    try:
-        code = parts[2].upper()
-        amt  = int(parts[3])
-        uses = int(parts[4]) if len(parts) > 4 else 1
-    except (IndexError, ValueError):
-        bot.reply_to(msg, "Формат: промо создать КОД СУММА [uses]")
-        return
-    with db() as c:
-        try:
-            c.execute("INSERT INTO promo_codes (code,reward,max_uses) VALUES (%s,%s,%s)",
-                      (code, amt, uses))
-        except Exception:
-            bot.reply_to(msg, "❌ Код уже существует")
-            return
-    bot.reply_to(msg, f"✅ Промокод <code>{code}</code> создан. +{fmt(amt)}, uses={uses}", parse_mode="HTML")
-
-
-@bot.message_handler(func=lambda m: m.text and m.text.lower().startswith("добавить товар ") and is_admin(m.from_user.id))
-@admin_only
-def cmd_add_item(msg):
-    parts = msg.text.split(None, 5)
-    try:
-        emoji  = parts[2]
-        name   = parts[3]
-        price  = int(parts[4])
-        supply = int(parts[5]) if len(parts) > 5 else -1
-    except (IndexError, ValueError):
-        bot.reply_to(msg, "Формат: добавить товар EMOJI ИМЯ ЦЕНА [supply]")
-        return
-    with db() as c:
-        c.execute("INSERT INTO items (name,emoji,price,supply) VALUES (%s,%s,%s,%s)",
-                  (name, emoji, price, supply))
-    bot.reply_to(msg, f"✅ Товар {emoji} {name} добавлен ({fmt(price)} {CURRENCY})")
-
-
-@bot.message_handler(func=lambda m: m.text and m.text.lower().startswith("стат") and is_admin(m.from_user.id))
-@admin_only
-def cmd_stats(msg):
-    with db() as c:
-        c.execute("SELECT COUNT(*) AS cnt FROM users")
-        users = c.fetchone()["cnt"]
-        c.execute("SELECT SUM(balance) AS s FROM users")
-        total_bal = c.fetchone()["s"] or 0
-        c.execute("SELECT jackpot FROM lottery WHERE id=1")
-        jackpot = (c.fetchone() or {}).get("jackpot", 0)
-
-    bot.reply_to(msg,
-        f"<b>📊 Статистика</b>\n"
-        f"Игроков: <b>{users}</b>\n"
-        f"Деньги в обороте: <b>{fmt(total_bal)} {CURRENCY}</b>\n"
-        f"Джекпот: <b>{fmt(jackpot)} {CURRENCY}</b>",
-        parse_mode="HTML")
-
-
-# ══════════════════════════════════════════════
-# 25. ГРУППОВЫЕ КОМАНДЫ
-# ══════════════════════════════════════════════
+# Баланс
 
 @bot.message_handler(func=lambda m: is_group(m) and m.text and
-    m.text.lower().strip() in ["баланс","б","/б","/баланс"])
+    m.text.lower().strip() in ["баланс", "б", "/б", "/баланс"])
 def group_balance(msg):
     uid  = msg.from_user.id
-    name = get_display_name(msg)
+    name = gname(msg)
     ensure_user(uid, name)
     u = get_user(uid)
-    if not u:
-        return
     lvl = user_level(u["xp"])
     bot.reply_to(msg,
         f"👤 {mention(uid, name)}\n"
-        f"💵 <b>{fmt(u['balance'])}</b>  🏦 {fmt(u['bank'])}\n"
+        f"💎 <b>{fmt(u['balance'])}</b>  🏦 {fmt(u['bank'])}\n"
         f"⚡ Уровень <b>{lvl}</b>",
         parse_mode="HTML")
 
 
+# Топ
+
 @bot.message_handler(func=lambda m: is_group(m) and m.text and
-    re.match(r'^(топ|/топ|top|/top)(\s+\S+)?$', m.text.lower().strip()))
+    re.match(r"^(топ|top)(\s+\S+)?$", m.text.lower().strip()))
 def group_top(msg):
-    parts = msg.text.strip().lower().split()
+    parts = msg.text.lower().strip().split()
     cat   = parts[1] if len(parts) > 1 else "баланс"
     medals = ["🥇","🥈","🥉","4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣","🔟"]
 
@@ -2293,193 +2539,207 @@ def group_top(msg):
             c.execute("SELECT name, xp FROM users ORDER BY xp DESC LIMIT 10")
             rows  = c.fetchall()
             title = "⭐ Топ по XP"
-            val   = lambda r: f"{fmt(r['xp'])} XP"
-        elif cat in ("акции","stocks"):
-            c.execute("""SELECT u.name, SUM(p.shares) AS s
-                         FROM portfolios p JOIN users u ON u.id=p.user_id
-                         WHERE p.ticker=%s GROUP BY u.name ORDER BY s DESC LIMIT 10""", (TICKER,))
-            rows  = c.fetchall()
-            title = "📈 Топ акционеров"
-            val   = lambda r: f"{r['s']} акций"
+            vf    = lambda r: f"{fmt(r['xp'])} XP"
         else:
             c.execute("SELECT name, balance FROM users ORDER BY balance DESC LIMIT 10")
             rows  = c.fetchall()
-            title = "💵 Топ по балансу"
-            val   = lambda r: fmt(r["balance"])
+            title = "💎 Топ по балансу"
+            vf    = lambda r: fmt(r["balance"])
 
-    if not rows:
-        bot.reply_to(msg, "Список пуст.")
-        return
-    lines = [f"{medals[i]} <b>{r['name'] or 'Игрок'}</b> — {val(r)}" for i, r in enumerate(rows)]
+    lines = [f"{medals[i]} <b>{r['name'] or 'Игрок'}</b> — {vf(r)}" for i, r in enumerate(rows)]
     bot.send_message(msg.chat.id,
         f"<b>{title}</b>\n━━━━━━━━━━━━━━━━\n" + "\n".join(lines),
         parse_mode="HTML")
 
 
+# Акции в группе
+
 @bot.message_handler(func=lambda m: is_group(m) and m.text and
     m.text.lower().strip() in ["акции","биржа","акция"])
 def group_stocks(msg):
-    st    = get_stock()
-    price = st["price"]
-    prev  = st["prev_price"]
-    chg   = (price - prev) / prev * 100
+    st  = _get_stock()
+    chg = (st["price"] - st["prev_price"]) / st["prev_price"] * 100
     arrow = "📈" if chg >= 0 else "📉"
     bot.send_message(msg.chat.id,
-        f"<b>📈 Биржа — {TICKER}</b>\n"
-        f"Цена: <b>{fmt(price)} {CURRENCY}</b>  {arrow} {chg:+.1f}%\n\n"
-        f"Купить/продать: в <b>личку</b> → меню → 📈 Биржа",
+        f"<b>📈 {TICKER}</b>  {fmt(st['price'])} {CUR}  {arrow} {chg:+.1f}%\n"
+        f"Купить/продать: в <b>личку</b> → /start → Биржа",
         parse_mode="HTML")
 
 
+# Рулетка в группе
+
 @bot.message_handler(func=lambda m: is_group(m) and m.text and
-    re.match(r'^(рул|рулетка)\s+\S+\s+\d+', m.text.lower().strip()))
+    re.match(r"^(рул|рулетка)\s+\S+\s+\d+", m.text.lower().strip()))
 def group_roulette(msg):
     uid  = msg.from_user.id
-    name = get_display_name(msg)
+    name = gname(msg)
     ensure_user(uid, name)
-
     parts = msg.text.strip().lower().split()
-    color_map = {
-        "красное":"red","красный":"red","red":"red","r":"red",
-        "чёрное":"black","черное":"black","black":"black","b":"black",
-        "зеро":"zero","0":"zero","zero":"zero",
-    }
-    color = color_map.get(parts[1])
-    if not color:
-        bot.reply_to(msg, "❌ Цвет: красное / чёрное / зеро")
-        return
-    try:
-        bet = int(parts[2])
-    except (ValueError, IndexError):
-        bot.reply_to(msg, "❌ Формат: рул красное 1000")
-        return
-    if bet <= 0:
-        bot.reply_to(msg, "❌ Ставка > 0")
-        return
-
+    color_in = parts[1]
+    try: bet = int(parts[2])
+    except ValueError:
+        bot.reply_to(msg, "❌ рул красное 1000"); return
+    if bet <= 0: return
     u = get_user(uid)
     if u["balance"] < bet:
-        bot.reply_to(msg, f"❌ Баланс: <b>{fmt(u['balance'])}</b>", parse_mode="HTML")
-        return
+        bot.reply_to(msg, f"❌ Баланс: {fmt(u['balance'])}"); return
+
+    color  = COLOR_MAP.get(color_in)
+    if not color:
+        bot.reply_to(msg, "❌ Цвет: красное / чёрное / зеро"); return
 
     num    = random.randint(0, 36)
     actual = "zero" if num == 0 else ("red" if num % 2 == 1 else "black")
-    mults  = {"red": 2, "black": 2, "zero": 14}
-    icons  = {"red": "🔴", "black": "⬛", "zero": "🟢"}
+    add_balance(uid, -bet)
 
     if actual == color:
-        win = bet * mults[color]
-        add_balance(uid, win - bet)
-        result = (f"✅ {mention(uid, name)} поставил на {icons[color]} и выиграл!\n"
-                  f"🎲 Выпало <b>{num}</b> {icons[actual]}\n"
-                  f"💰 +<b>{fmt(win - bet)} {CURRENCY}</b>")
+        win = bet * COLOR_MULT[color]
+        add_balance(uid, win)
+        res = f"✅ {mention(uid,name)} поставил {COLOR_ICON[color]} выпало {num} {COLOR_ICON[actual]} — победа! +{fmt(win-bet)}"
     else:
-        add_balance(uid, -bet)
-        result = (f"😔 {mention(uid, name)} поставил на {icons[color]} и проиграл.\n"
-                  f"🎲 Выпало <b>{num}</b> {icons[actual]}\n"
-                  f"💸 -<b>{fmt(bet)} {CURRENCY}</b>")
+        res = f"😔 {mention(uid,name)} поставил {COLOR_ICON[color]} выпало {num} {COLOR_ICON[actual]} — мимо. -{fmt(bet)}"
+    log_game(uid, "Рулетка(гр)", bet, win-bet if actual==color else -bet)
+    bot.send_message(msg.chat.id, res + f" {CUR}", parse_mode="HTML")
 
-    bot.send_message(msg.chat.id, result, parse_mode="HTML")
 
+# Кости в группе
 
 @bot.message_handler(func=lambda m: is_group(m) and m.text and
-    re.match(r'^(кости|куб|кубик|dice)\s+\d+', m.text.lower().strip()))
+    re.match(r"^(кости|куб|кубик|dice)\s+\d+", m.text.lower().strip()))
 def group_dice(msg):
     uid  = msg.from_user.id
-    name = get_display_name(msg)
+    name = gname(msg)
     ensure_user(uid, name)
-    try:
-        bet = int(msg.text.strip().split()[1])
-    except (ValueError, IndexError):
-        bot.reply_to(msg, "❌ Формат: кости 1000")
-        return
-    if bet <= 0:
-        bot.reply_to(msg, "❌ Ставка > 0")
-        return
+    try: bet = int(msg.text.strip().split()[1])
+    except ValueError: return
+    if bet <= 0: return
     u = get_user(uid)
     if u["balance"] < bet:
-        bot.reply_to(msg, f"❌ Баланс: <b>{fmt(u['balance'])}</b>", parse_mode="HTML")
-        return
-
+        bot.reply_to(msg, f"❌ Баланс: {fmt(u['balance'])}"); return
     add_balance(uid, -bet)
     sent = bot.send_dice(msg.chat.id, emoji="🎲", reply_to_message_id=msg.message_id)
     time.sleep(3)
     val = sent.dice.value
     if val >= 4:
-        win = int(bet * 2)
+        win = bet * 2
         add_balance(uid, win)
         bot.send_message(msg.chat.id,
-            f"🎲 {mention(uid, name)} бросил <b>{val}</b> — победа!\n"
-            f"💰 +<b>{fmt(win - bet)} {CURRENCY}</b>", parse_mode="HTML")
+            f"🎲 {mention(uid,name)} бросил <b>{val}</b> — победа! +{fmt(win-bet)} {CUR}",
+            parse_mode="HTML")
+        log_game(uid, "Кубик(гр)", bet, win-bet)
     else:
         bot.send_message(msg.chat.id,
-            f"🎲 {mention(uid, name)} бросил <b>{val}</b> — мимо.\n"
-            f"💸 -<b>{fmt(bet)} {CURRENCY}</b>", parse_mode="HTML")
+            f"🎲 {mention(uid,name)} бросил <b>{val}</b> — мимо. -{fmt(bet)} {CUR}",
+            parse_mode="HTML")
+        log_game(uid, "Кубик(гр)", bet, -bet)
 
+
+# Слоты в группе
 
 @bot.message_handler(func=lambda m: is_group(m) and m.text and
-    re.match(r'^(слот|слоты|slots?)\s+\d+', m.text.lower().strip()))
+    re.match(r"^(слот|слоты|slots?)\s+\d+", m.text.lower().strip()))
 def group_slots(msg):
     uid  = msg.from_user.id
-    name = get_display_name(msg)
+    name = gname(msg)
     ensure_user(uid, name)
-    try:
-        bet = int(msg.text.strip().split()[1])
-    except (ValueError, IndexError):
-        bot.reply_to(msg, "❌ Формат: слот 1000")
-        return
-    if bet <= 0:
-        bot.reply_to(msg, "❌ Ставка > 0")
-        return
+    try: bet = int(msg.text.strip().split()[1])
+    except ValueError: return
+    if bet <= 0: return
     u = get_user(uid)
     if u["balance"] < bet:
-        bot.reply_to(msg, f"❌ Баланс: {fmt(u['balance'])}")
-        return
-
-    reels = [random.choice(SLOT_SYMBOLS) for _ in range(3)]
+        bot.reply_to(msg, f"❌ Баланс: {fmt(u['balance'])}"); return
+    reels = [random.choice(SLOT_SYM) for _ in range(3)]
     combo = "".join(reels)
-    mult  = SLOT_PAYOUTS.get(combo, 0)
+    mult  = SLOT_PAY.get(combo, 0)
+    add_balance(uid, -bet)
     if mult:
         win = bet * mult
-        add_balance(uid, win - bet)
+        add_balance(uid, win)
         bot.send_message(msg.chat.id,
-            f"🎰 {mention(uid, name)}: {combo}\n🎉 Джекпот x{mult}! +<b>{fmt(win - bet)} {CURRENCY}</b>",
+            f"🎰 {mention(uid,name)}: {combo} 🎉 x{mult} +{fmt(win-bet)} {CUR}",
             parse_mode="HTML")
+        log_game(uid,"Слоты(гр)",bet,win-bet)
     else:
-        add_balance(uid, -bet)
         bot.send_message(msg.chat.id,
-            f"🎰 {mention(uid, name)}: {combo}\n😔 Нет совпадений. -<b>{fmt(bet)} {CURRENCY}</b>",
+            f"🎰 {mention(uid,name)}: {combo} 😔 -{fmt(bet)} {CUR}",
             parse_mode="HTML")
+        log_game(uid,"Слоты(гр)",bet,-bet)
 
 
-# ── Дуэль ──────────────────────────────────
+# Краш в группе
+
+@bot.message_handler(func=lambda m: is_group(m) and m.text and
+    re.match(r"^(краш|crash)\s+\d+", m.text.lower().strip()))
+def group_crash(msg):
+    uid  = msg.from_user.id
+    name = gname(msg)
+    ensure_user(uid, name)
+    try: bet = int(msg.text.strip().split()[1])
+    except ValueError: return
+    if bet <= 0: return
+    u = get_user(uid)
+    if u["balance"] < bet:
+        bot.reply_to(msg, f"❌ Баланс: {fmt(u['balance'])}"); return
+    crash_at = max(1.01, round(random.expovariate(0.9)+1.0, 2))
+    add_balance(uid, -bet)
+    kb_crash = InlineKeyboardMarkup(row_width=4)
+    for m_ in ["1.5","2.0","3.0","5.0"]:
+        kb_crash.insert(InlineKeyboardButton(
+            f"x{m_}", callback_data=f"gcrash_{uid}_{m_}_{bet}_{crash_at}"))
+    bot.send_message(msg.chat.id,
+        f"⚡ {mention(uid,name)}  Ставка: {fmt(bet)}\nЗабери до краша!",
+        parse_mode="HTML", reply_markup=kb_crash)
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("gcrash_"))
+def cb_group_crash(call):
+    parts    = call.data.split("_")
+    o_uid    = int(parts[1])
+    mult     = float(parts[2])
+    bet      = int(parts[3])
+    crash_at = float(parts[4])
+    uid      = call.from_user.id
+    if uid != o_uid:
+        bot.answer_callback_query(call.id, "Не ваша игра"); return
+    name = call.from_user.first_name or str(uid)
+    if mult <= crash_at:
+        win = int(bet * mult)
+        add_balance(uid, win)
+        result = win - bet
+        txt = f"✅ {mention(uid,name)} забрал x{mult}! +{fmt(result)} {CUR}"
+        log_game(uid,"Краш(гр)",bet,result)
+    else:
+        result = -bet
+        txt = f"💥 Краш x{crash_at}! {mention(uid,name)} -{fmt(bet)} {CUR}"
+        log_game(uid,"Краш(гр)",bet,result)
+    try:
+        bot.edit_message_text(txt, call.message.chat.id, call.message.message_id,
+                              parse_mode="HTML")
+    except Exception: pass
+    bot.answer_callback_query(call.id)
+
+
+# Дуэль в группе
 
 _duels: dict[int, dict] = {}
 
 @bot.message_handler(func=lambda m: is_group(m) and m.text and
-    re.match(r'^(дуэль|дуэл|duel)\s+\d+', m.text.lower().strip()))
-def group_duel_create(msg):
-    uid   = msg.from_user.id
-    cname = get_display_name(msg)
-    ensure_user(uid, cname)
-
-    try:
-        bet = int(msg.text.strip().split()[1])
-    except (ValueError, IndexError):
-        bot.reply_to(msg, "❌ Формат: дуэль 1000")
-        return
-    if bet <= 0:
-        bot.reply_to(msg, "❌ Ставка > 0")
-        return
+    re.match(r"^(дуэль|duel)\s+\d+", m.text.lower().strip()))
+def group_duel(msg):
+    uid  = msg.from_user.id
+    name = gname(msg)
+    ensure_user(uid, name)
+    try: bet = int(msg.text.strip().split()[1])
+    except ValueError: return
+    if bet <= 0: return
     u = get_user(uid)
     if u["balance"] < bet:
-        bot.reply_to(msg, f"❌ Баланс: {fmt(u['balance'])}")
-        return
+        bot.reply_to(msg, f"❌ Баланс: {fmt(u['balance'])}"); return
     if uid in _duels:
-        bot.reply_to(msg, "❌ У тебя уже есть активная дуэль")
-        return
+        bot.reply_to(msg, "❌ У тебя уже активная дуэль"); return
 
-    opp_uid, opp_name = None, "любой игрок"
+    # Определяем соперника (reply)
+    opp_uid, opp_name = None, "любой"
     if msg.reply_to_message and msg.reply_to_message.from_user:
         ru = msg.reply_to_message.from_user
         if ru.id != uid and not ru.is_bot:
@@ -2487,19 +2747,15 @@ def group_duel_create(msg):
             opp_name = ru.first_name or str(ru.id)
             ensure_user(opp_uid, opp_name)
 
-    _duels[uid] = {
-        "bet": bet, "opponent": opp_uid, "cname": cname, "oname": opp_name,
-        "chat_id": msg.chat.id, "expires": now() + 60
-    }
+    _duels[uid] = {"bet": bet, "opp": opp_uid, "cname": name,
+                   "chat": msg.chat.id, "expires": now()+60}
 
-    target_str = mention(opp_uid, opp_name) if opp_uid else "<b>любой игрок</b>"
-    kb_duel = InlineKeyboardMarkup()
-    kb_duel.add(InlineKeyboardButton("⚔️ Принять дуэль", callback_data=f"duel_accept_{uid}"))
-
+    opp_str = mention(opp_uid, opp_name) if opp_uid else "<b>любой игрок</b>"
     sent = bot.send_message(msg.chat.id,
-        f"⚔️ {mention(uid, cname)} вызывает {target_str} на дуэль!\n"
-        f"Ставка: <b>{fmt(bet)} {CURRENCY}</b>\n⏱ 60 секунд на принятие",
-        parse_mode="HTML", reply_markup=kb_duel)
+        f"⚔️ {mention(uid,name)} вызывает {opp_str} на дуэль!\n"
+        f"Ставка: <b>{fmt(bet)} {CUR}</b>  ⏱60с",
+        parse_mode="HTML",
+        reply_markup=kb([(f"⚔️ Принять", f"duel_acc_{uid}")]))
     _duels[uid]["msg_id"] = sent.message_id
 
     def _cancel():
@@ -2508,473 +2764,573 @@ def group_duel_create(msg):
             _duels.pop(uid, None)
             try:
                 bot.edit_message_text(
-                    f"⚔️ Дуэль от {mention(uid, cname)} отменена — никто не принял.",
+                    f"⚔️ Дуэль {mention(uid,name)} отменена.",
                     msg.chat.id, sent.message_id, parse_mode="HTML")
-            except Exception:
-                pass
+            except Exception: pass
     threading.Thread(target=_cancel, daemon=True).start()
 
 
-@bot.callback_query_handler(func=lambda c: c.data.startswith("duel_accept_"))
+@bot.callback_query_handler(func=lambda c: c.data.startswith("duel_acc_"))
 def cb_duel_accept(call):
-    challenger_uid = int(call.data[12:])
-    opp_uid        = call.from_user.id
-    opp_name       = call.from_user.first_name or str(opp_uid)
-
-    duel = _duels.get(challenger_uid)
+    c_uid = int(call.data[9:])
+    o_uid = call.from_user.id
+    oname = call.from_user.first_name or str(o_uid)
+    duel  = _duels.get(c_uid)
     if not duel:
-        bot.answer_callback_query(call.id, "Дуэль уже завершена")
-        return
+        bot.answer_callback_query(call.id, "Дуэль завершена"); return
     if duel["expires"] < now():
-        _duels.pop(challenger_uid, None)
-        bot.answer_callback_query(call.id, "Время вышло")
-        return
-    if challenger_uid == opp_uid:
-        bot.answer_callback_query(call.id, "❌ Нельзя принять свою дуэль")
-        return
-    if duel["opponent"] and duel["opponent"] != opp_uid:
-        bot.answer_callback_query(call.id, "❌ Эта дуэль не для тебя")
-        return
+        _duels.pop(c_uid, None)
+        bot.answer_callback_query(call.id, "Время вышло"); return
+    if c_uid == o_uid:
+        bot.answer_callback_query(call.id, "❌ Своя дуэль"); return
+    if duel["opp"] and duel["opp"] != o_uid:
+        bot.answer_callback_query(call.id, "❌ Не для тебя"); return
 
-    ensure_user(opp_uid, opp_name)
-    bet     = duel["bet"]
-    cname   = duel["cname"]
-    chat_id = duel["chat_id"]
-
-    ou = get_user(opp_uid)
-    cu = get_user(challenger_uid)
+    ensure_user(o_uid, oname)
+    bet   = duel["bet"]
+    cname = duel["cname"]
+    chat  = duel["chat"]
+    cu    = get_user(c_uid)
+    ou    = get_user(o_uid)
     if ou["balance"] < bet:
-        bot.answer_callback_query(call.id, f"❌ Нужно {fmt(bet)}", show_alert=True)
-        return
+        bot.answer_callback_query(call.id, f"❌ Нужно {fmt(bet)}", show_alert=True); return
     if cu["balance"] < bet:
-        bot.answer_callback_query(call.id, "❌ У организатора недостаточно средств", show_alert=True)
-        _duels.pop(challenger_uid, None)
-        return
+        bot.answer_callback_query(call.id, "❌ У организатора не хватает", show_alert=True)
+        _duels.pop(c_uid, None); return
 
-    _duels.pop(challenger_uid, None)
+    _duels.pop(c_uid, None)
     bot.answer_callback_query(call.id)
 
-    c_roll, o_roll = random.randint(1, 6), random.randint(1, 6)
-    rerolls = 0
-    while c_roll == o_roll and rerolls < 5:
-        c_roll, o_roll = random.randint(1, 6), random.randint(1, 6)
-        rerolls += 1
+    cr = random.randint(1, 6)
+    or_ = random.randint(1, 6)
+    tries = 0
+    while cr == or_ and tries < 5:
+        cr = random.randint(1, 6); or_ = random.randint(1, 6); tries += 1
 
-    if c_roll > o_roll:
-        w_uid, w_name = challenger_uid, cname
-        l_uid         = opp_uid
+    if cr > or_:
+        w_uid, w_name = c_uid, cname
+        l_uid = o_uid
     else:
-        w_uid, w_name = opp_uid, opp_name
-        l_uid         = challenger_uid
+        w_uid, w_name = o_uid, oname
+        l_uid = c_uid
 
     add_balance(l_uid, -bet)
-    add_balance(w_uid,  bet)
+    add_balance(w_uid, bet)
+    log_game(w_uid, "Дуэль", bet, bet)
+    log_game(l_uid, "Дуэль", bet, -bet)
 
     try:
         bot.edit_message_text(
             f"⚔️ <b>Дуэль!</b>\n"
-            f"{mention(challenger_uid, cname)}: 🎲 <b>{c_roll}</b>\n"
-            f"{mention(opp_uid, opp_name)}: 🎲 <b>{o_roll}</b>\n\n"
-            f"🏆 Победил {mention(w_uid, w_name)}!\n💰 +<b>{fmt(bet)} {CURRENCY}</b>",
-            chat_id, call.message.message_id, parse_mode="HTML")
-    except Exception:
-        bot.send_message(chat_id,
-            f"🏆 Победил {mention(w_uid, w_name)}! +{fmt(bet)} {CURRENCY}", parse_mode="HTML")
+            f"{mention(c_uid,cname)}: 🎲<b>{cr}</b>  vs  {mention(o_uid,oname)}: 🎲<b>{or_}</b>\n"
+            f"🏆 {mention(w_uid,w_name)} +{fmt(bet)} {CUR}",
+            chat, call.message.message_id, parse_mode="HTML")
+    except Exception: pass
 
 
-# ── КНБ ────────────────────────────────────
+# КНБ в группе
 
-_knb_games: dict[int, dict] = {}
+_knb: dict[int, dict] = {}
 KNB_BEATS = {"камень":"ножницы","ножницы":"бумага","бумага":"камень"}
 KNB_EMOJI = {"камень":"🪨","ножницы":"✂️","бумага":"📄"}
 
 @bot.message_handler(func=lambda m: is_group(m) and m.reply_to_message and
-    m.text and re.match(r'^(кнб|рпс|knb)\s+\d+', m.text.lower().strip()))
-def group_knb_create(msg):
-    uid   = msg.from_user.id
-    cname = get_display_name(msg)
-    ensure_user(uid, cname)
-
+    m.text and re.match(r"^(кнб|knb|рпс)\s+\d+", m.text.lower().strip()))
+def group_knb(msg):
+    uid  = msg.from_user.id
+    name = gname(msg)
+    ensure_user(uid, name)
     ru = msg.reply_to_message.from_user
-    if not ru or ru.id == uid or ru.is_bot:
-        bot.reply_to(msg, "❌ Сделай reply на сообщение соперника")
-        return
-    try:
-        bet = int(msg.text.strip().split()[1])
-    except (ValueError, IndexError):
-        bot.reply_to(msg, "❌ Формат: кнб 1000 (reply)")
-        return
-    if bet <= 0:
-        bot.reply_to(msg, "❌ Ставка > 0")
-        return
+    if not ru or ru.id == uid or ru.is_bot: return
+    try: bet = int(msg.text.strip().split()[1])
+    except ValueError: return
+    if bet <= 0: return
     u = get_user(uid)
-    if u["balance"] < bet:
-        bot.reply_to(msg, f"❌ Баланс: {fmt(u['balance'])}")
-        return
+    if u["balance"] < bet: return
+    o_uid  = ru.id
+    oname  = ru.first_name or str(o_uid)
+    ensure_user(o_uid, oname)
 
-    ouid  = ru.id
-    oname = ru.first_name or str(ouid)
-    ensure_user(ouid, oname)
-
-    _knb_games[uid] = {
-        "bet": bet, "chat": msg.chat.id,
-        "c_uid": uid, "c_name": cname, "c_choice": None,
-        "o_uid": ouid, "o_name": oname, "o_choice": None,
-        "expires": now() + 120
-    }
-
+    gid = uid
+    _knb[gid] = {"bet":bet,"chat":msg.chat.id,
+                 "c_uid":uid,"c_name":name,"c_ch":None,
+                 "o_uid":o_uid,"o_name":oname,"o_ch":None,
+                 "expires":now()+120}
     kb_knb = InlineKeyboardMarkup(row_width=3)
-    kb_knb.add(
-        InlineKeyboardButton("🪨", callback_data=f"knb_{uid}_камень"),
-        InlineKeyboardButton("✂️", callback_data=f"knb_{uid}_ножницы"),
-        InlineKeyboardButton("📄", callback_data=f"knb_{uid}_бумага"),
-    )
+    for k in ["камень","ножницы","бумага"]:
+        kb_knb.add(InlineKeyboardButton(KNB_EMOJI[k], callback_data=f"knb_{gid}_{k}"))
+
     bot.send_message(msg.chat.id,
-        f"🪨✂️📄 <b>КНБ!</b>\n{mention(uid, cname)} vs {mention(ouid, oname)}\n"
-        f"Ставка: <b>{fmt(bet)} {CURRENCY}</b>\nОба выбирают втайне 👇",
+        f"🪨✂️📄 {mention(uid,name)} vs {mention(o_uid,oname)}\n"
+        f"Ставка: <b>{fmt(bet)} {CUR}</b>  Выбирайте👇",
         parse_mode="HTML", reply_markup=kb_knb)
 
 
-@bot.callback_query_handler(func=lambda c: re.match(r'^knb_\d+_\S+$', c.data))
-def cb_knb_choice(call):
-    parts   = call.data.split("_")
-    game_id = int(parts[1])
-    choice  = parts[2]
-    uid     = call.from_user.id
-
-    game = _knb_games.get(game_id)
-    if not game:
-        bot.answer_callback_query(call.id, "Игра завершена")
-        return
-    if game["expires"] < now():
-        _knb_games.pop(game_id, None)
-        bot.answer_callback_query(call.id, "Время вышло")
-        return
+@bot.callback_query_handler(func=lambda c: re.match(r"^knb_\d+_\S+$", c.data))
+def cb_knb(call):
+    parts  = call.data.split("_")
+    gid    = int(parts[1])
+    choice = parts[2]
+    uid    = call.from_user.id
+    game   = _knb.get(gid)
+    if not game or game["expires"] < now():
+        bot.answer_callback_query(call.id, "Игра завершена"); return
 
     if uid == game["c_uid"]:
-        if game["c_choice"]:
-            bot.answer_callback_query(call.id, "Ты уже выбрал!")
-            return
-        game["c_choice"] = choice
-        bot.answer_callback_query(call.id, f"Ты выбрал {KNB_EMOJI[choice]} — ждём соперника")
+        if game["c_ch"]:
+            bot.answer_callback_query(call.id, "Уже выбрал"); return
+        game["c_ch"] = choice
     elif uid == game["o_uid"]:
-        if game["o_choice"]:
-            bot.answer_callback_query(call.id, "Ты уже выбрал!")
-            return
-        game["o_choice"] = choice
-        bot.answer_callback_query(call.id, f"Ты выбрал {KNB_EMOJI[choice]} — ждём соперника")
+        if game["o_ch"]:
+            bot.answer_callback_query(call.id, "Уже выбрал"); return
+        game["o_ch"] = choice
     else:
-        bot.answer_callback_query(call.id, "Ты не участник этой игры")
-        return
+        bot.answer_callback_query(call.id, "Не участник"); return
 
-    if not game["c_choice"] or not game["o_choice"]:
-        return
+    bot.answer_callback_query(call.id, f"Ты выбрал {KNB_EMOJI[choice]}")
+    if not game["c_ch"] or not game["o_ch"]: return
 
-    _knb_games.pop(game_id, None)
-    cc, oc = game["c_choice"], game["o_choice"]
+    _knb.pop(gid, None)
+    cc, oc = game["c_ch"], game["o_ch"]
     bet    = game["bet"]
 
     if cc == oc:
-        result = f"🤝 Ничья!\n{KNB_EMOJI[cc]} vs {KNB_EMOJI[oc]}\nСтавки возвращены."
+        result = f"🤝 Ничья! Ставки возвращены."
     elif KNB_BEATS[cc] == oc:
         add_balance(game["o_uid"], -bet)
-        add_balance(game["c_uid"],  bet)
-        result = (f"🏆 Победил {mention(game['c_uid'], game['c_name'])}!\n"
-                  f"{KNB_EMOJI[cc]} бьёт {KNB_EMOJI[oc]}\n💰 +<b>{fmt(bet)} {CURRENCY}</b>")
+        add_balance(game["c_uid"], bet)
+        log_game(game["c_uid"],"КНБ",bet,bet)
+        log_game(game["o_uid"],"КНБ",bet,-bet)
+        result = f"🏆 {mention(game['c_uid'],game['c_name'])} {KNB_EMOJI[cc]} +{fmt(bet)} {CUR}"
     else:
         add_balance(game["c_uid"], -bet)
-        add_balance(game["o_uid"],  bet)
-        result = (f"🏆 Победил {mention(game['o_uid'], game['o_name'])}!\n"
-                  f"{KNB_EMOJI[oc]} бьёт {KNB_EMOJI[cc]}\n💰 +<b>{fmt(bet)} {CURRENCY}</b>")
+        add_balance(game["o_uid"], bet)
+        log_game(game["o_uid"],"КНБ",bet,bet)
+        log_game(game["c_uid"],"КНБ",bet,-bet)
+        result = f"🏆 {mention(game['o_uid'],game['o_name'])} {KNB_EMOJI[oc]} +{fmt(bet)} {CUR}"
 
     try:
         bot.edit_message_text(
-            f"🪨✂️📄 <b>КНБ — результат</b>\n"
-            f"{mention(game['c_uid'], game['c_name'])}: {KNB_EMOJI[cc]}\n"
-            f"{mention(game['o_uid'], game['o_name'])}: {KNB_EMOJI[oc]}\n\n{result}",
+            f"🪨✂️📄  {mention(game['c_uid'],game['c_name'])}: {KNB_EMOJI[cc]}\n"
+            f"        {mention(game['o_uid'],game['o_name'])}: {KNB_EMOJI[oc]}\n"
+            f"{result}",
             game["chat"], call.message.message_id, parse_mode="HTML")
-    except Exception:
-        bot.send_message(game["chat"], result, parse_mode="HTML")
+    except Exception: pass
 
 
-# ── Чек ────────────────────────────────────
+# Чек (групповой перевод кодом)
 
 _checks: dict[str, dict] = {}
 
-@bot.message_handler(func=lambda m: m.text and re.match(r'^чек\s+\d+(\s+\d+)?$', m.text.lower().strip()))
+@bot.message_handler(func=lambda m: m.text and
+    re.match(r"^чек\s+\d+(\s+\d+)?$", m.text.lower().strip()))
 def cmd_check_create(msg):
     uid  = msg.from_user.id
-    name = get_display_name(msg)
+    name = gname(msg)
     ensure_user(uid, name)
     parts = msg.text.strip().split()
     try:
         amount = int(parts[1])
         uses   = int(parts[2]) if len(parts) > 2 else 1
-    except (ValueError, IndexError):
-        bot.reply_to(msg, "❌ Формат: чек 5000 [кол-во активаций]")
-        return
-    if amount <= 0 or uses <= 0:
-        bot.reply_to(msg, "❌ Значения > 0")
-        return
+    except ValueError: return
+    if amount <= 0 or uses <= 0: return
     total = amount * uses
     u = get_user(uid)
     if u["balance"] < total:
-        bot.reply_to(msg, f"❌ Нужно {fmt(total)}, баланс: {fmt(u['balance'])}")
-        return
+        bot.reply_to(msg, f"❌ Нужно {fmt(total)}, баланс: {fmt(u['balance'])}"); return
     add_balance(uid, -total)
-    code = f"CHK{''.join(random.choices('ABCDEFGHJKLMNPQRSTUVWXYZ23456789', k=6))}"
-    _checks[code] = {"amount": amount, "uses": uses, "left": uses, "uid": uid}
+    code = "C" + "".join(random.choices("ABCDEFGHJKLMNPQRSTUVWXYZ23456789", k=7))
+    _checks[code] = {"amount": amount, "left": uses, "uid": uid}
     bot.send_message(msg.chat.id,
-        f"💸 {mention(uid, name)} создал чек!\n"
-        f"💵 <b>{fmt(amount)} {CURRENCY}</b> × {uses} активаций\n\n"
-        f"Код: <code>{code}</code>\nАктивировать: <code>активировать {code}</code>",
+        f"💸 {mention(uid,name)} создал чек!\n"
+        f"{fmt(amount)} {CUR} × {uses} активаций\n"
+        f"Код: <code>{code}</code>\n"
+        f"Активировать: <code>активировать {code}</code>",
         parse_mode="HTML")
 
 
-@bot.message_handler(func=lambda m: m.text and re.match(r'^активировать\s+\S+', m.text.lower().strip()))
+@bot.message_handler(func=lambda m: m.text and
+    re.match(r"^активировать\s+\S+", m.text.lower().strip()))
 def cmd_check_use(msg):
     uid  = msg.from_user.id
-    name = get_display_name(msg)
+    name = gname(msg)
     ensure_user(uid, name)
     code = msg.text.strip().split()[1].upper()
     chk  = _checks.get(code)
     if not chk:
-        bot.reply_to(msg, "❌ Чек не найден или уже использован")
-        return
+        bot.reply_to(msg, "❌ Чек не найден"); return
     if chk["uid"] == uid:
-        bot.reply_to(msg, "❌ Нельзя активировать свой чек")
-        return
-
-    amount = chk["amount"]
-    add_balance(uid, amount)
+        bot.reply_to(msg, "❌ Нельзя свой чек"); return
+    add_balance(uid, chk["amount"])
     chk["left"] -= 1
-    extra = " — чек исчерпан" if chk["left"] <= 0 else f" — осталось {chk['left']} активаций"
+    extra = "" if chk["left"] > 0 else " — исчерпан"
     if chk["left"] <= 0:
         _checks.pop(code, None)
-
     bot.reply_to(msg,
-        f"✅ {mention(uid, name)} активировал чек!\n"
-        f"💰 +<b>{fmt(amount)} {CURRENCY}</b>{extra}",
+        f"✅ {mention(uid,name)} +{fmt(chk['amount'])} {CUR}{extra}",
         parse_mode="HTML")
 
 
-# ── Перевод в группе ────────────────────────
+# Перевод в группе
 
 @bot.message_handler(func=lambda m: is_group(m) and m.text and
-    re.match(r'^(дать|перевод|pay)\s+', m.text.lower().strip()))
+    re.match(r"^(дать|pay)\s+", m.text.lower().strip()))
 def group_transfer(msg):
     uid  = msg.from_user.id
-    name = get_display_name(msg)
+    name = gname(msg)
     ensure_user(uid, name)
-
     parts  = msg.text.strip().split()
     to_uid, to_name, amount = None, None, None
 
     if msg.reply_to_message and msg.reply_to_message.from_user:
         ru = msg.reply_to_message.from_user
-        if ru.id == uid or ru.is_bot:
-            bot.reply_to(msg, "❌ Некорректный получатель")
-            return
+        if ru.id == uid or ru.is_bot: return
         to_uid  = ru.id
         to_name = ru.first_name or str(ru.id)
         ensure_user(to_uid, to_name)
-        try:
-            amount = int(parts[1])
-        except (ValueError, IndexError):
-            bot.reply_to(msg, "❌ Формат: дать 5000 (reply)")
-            return
+        try: amount = int(parts[1])
+        except ValueError: return
     else:
-        if len(parts) < 3:
-            bot.reply_to(msg, "❌ Формат: дать @username 5000")
-            return
+        if len(parts) < 3: return
         uname = parts[1].lstrip("@")
         with db() as c:
-            c.execute("SELECT id, name FROM users WHERE name ILIKE %s", (f"%{uname}%",))
+            c.execute("SELECT id,name FROM users WHERE name LIKE ?", (f"%{uname}%",))
             row = c.fetchone()
-        if not row:
-            bot.reply_to(msg, "❌ Игрок не найден")
-            return
-        to_uid, to_name = row["id"], row["name"]
-        if to_uid == uid:
-            bot.reply_to(msg, "❌ Нельзя переводить самому себе")
-            return
-        try:
-            amount = int(parts[2])
-        except (ValueError, IndexError):
-            bot.reply_to(msg, "❌ Укажи сумму")
-            return
+        if not row: return
+        to_uid  = row["id"]
+        to_name = row["name"]
+        if to_uid == uid: return
+        try: amount = int(parts[2])
+        except ValueError: return
 
-    if amount <= 0:
-        bot.reply_to(msg, "❌ Сумма > 0")
-        return
-
+    if not amount or amount <= 0: return
     fee   = int(amount * TRANSFER_FEE)
     total = amount + fee
     u = get_user(uid)
     if u["balance"] < total:
-        bot.reply_to(msg, f"❌ Нужно {fmt(total)} (комиссия {fmt(fee)}), баланс: {fmt(u['balance'])}")
-        return
-
+        bot.reply_to(msg, f"❌ Нужно {fmt(total)}"); return
     add_balance(uid, -total)
     add_balance(to_uid, amount)
     with db() as c:
-        c.execute("INSERT INTO transfers (from_id,to_id,amount,fee,ts) VALUES (%s,%s,%s,%s,%s)",
+        c.execute("INSERT INTO transfers (from_id,to_id,amount,fee,ts) VALUES (?,?,?,?,?)",
                   (uid, to_uid, amount, fee, now()))
-
     bot.send_message(msg.chat.id,
-        f"💸 {mention(uid, name)} → {mention(to_uid, to_name)}\n"
-        f"<b>{fmt(amount)} {CURRENCY}</b>  (комиссия {fmt(fee)})",
+        f"💸 {mention(uid,name)} → {mention(to_uid,to_name)}\n"
+        f"<b>{fmt(amount)} {CUR}</b>  (комиссия {fmt(fee)})",
         parse_mode="HTML")
 
 
-# ── Краш в группе ──────────────────────────
+# Лотерея в группе
 
 @bot.message_handler(func=lambda m: is_group(m) and m.text and
-    re.match(r'^(краш|crash)\s+\d+', m.text.lower().strip()))
-def group_crash(msg):
+    re.match(r"^(лот|лотерея)\s+\d+", m.text.lower().strip()))
+def group_lotto(msg):
     uid  = msg.from_user.id
-    name = get_display_name(msg)
+    name = gname(msg)
     ensure_user(uid, name)
-    try:
-        bet = int(msg.text.strip().split()[1])
-    except (ValueError, IndexError):
-        bot.reply_to(msg, "❌ Формат: краш 1000")
-        return
-    if bet <= 0:
-        bot.reply_to(msg, "❌ Ставка > 0")
-        return
-    u = get_user(uid)
-    if u["balance"] < bet:
-        bot.reply_to(msg, f"❌ Баланс: {fmt(u['balance'])}")
-        return
-
-    crash_at = round(max(1.01, random.expovariate(0.8) + 1.0), 2)
-    add_balance(uid, -bet)
-
-    kb_crash = InlineKeyboardMarkup(row_width=3)
-    kb_crash.add(
-        InlineKeyboardButton("💰 x1.5", callback_data=f"grcrash_{uid}_1.5_{bet}_{crash_at}"),
-        InlineKeyboardButton("💰 x2.0", callback_data=f"grcrash_{uid}_2.0_{bet}_{crash_at}"),
-        InlineKeyboardButton("💰 x3.0", callback_data=f"grcrash_{uid}_3.0_{bet}_{crash_at}"),
-    )
-    bot.send_message(msg.chat.id,
-        f"⚡ {mention(uid, name)} запустил краш!\n"
-        f"Ставка: <b>{fmt(bet)} {CURRENCY}</b>\nМножитель растёт... Успей забрать!",
-        parse_mode="HTML", reply_markup=kb_crash)
-
-
-@bot.callback_query_handler(func=lambda c: c.data.startswith("grcrash_"))
-def cb_group_crash(call):
-    parts    = call.data.split("_")
-    owner    = int(parts[1])
-    mult     = float(parts[2])
-    bet      = int(parts[3])
-    crash_at = float(parts[4])
-    uid      = call.from_user.id
-
-    if uid != owner:
-        bot.answer_callback_query(call.id, "Это не твоя игра")
-        return
-
-    name = call.from_user.first_name or str(uid)
-    if mult <= crash_at:
-        win = int(bet * mult)
-        add_balance(uid, win)
-        result = f"✅ {mention(uid, name)} забрал x{mult}! +<b>{fmt(win)} {CURRENCY}</b>"
-    else:
-        result = f"💥 Краш на x{crash_at}! {mention(uid, name)} проиграл -{fmt(bet)} {CURRENCY}"
-
-    try:
-        bot.edit_message_text(result, call.message.chat.id, call.message.message_id, parse_mode="HTML")
-    except Exception:
-        bot.send_message(call.message.chat.id, result, parse_mode="HTML")
-    bot.answer_callback_query(call.id)
-
-
-# ── Лотерея в группе ───────────────────────
-
-@bot.message_handler(func=lambda m: is_group(m) and m.text and
-    re.match(r'^(лот|лотерея)\s+\d+', m.text.lower().strip()))
-def group_lottery(msg):
-    uid  = msg.from_user.id
-    name = get_display_name(msg)
-    ensure_user(uid, name)
-    try:
-        qty = max(1, min(int(msg.text.strip().split()[1]), 100))
-    except (ValueError, IndexError):
-        bot.reply_to(msg, "❌ Формат: лот 3")
-        return
-
+    try: qty = min(100, int(msg.text.strip().split()[1]))
+    except ValueError: return
     cost = TICKET_PRICE * qty
     u = get_user(uid)
     if u["balance"] < cost:
-        bot.reply_to(msg, f"❌ Нужно {fmt(cost)}, баланс: {fmt(u['balance'])}")
-        return
-
+        bot.reply_to(msg, f"❌ Нужно {fmt(cost)}"); return
     add_balance(uid, -cost)
     with db() as c:
-        c.execute("""INSERT INTO lottery_tickets (user_id, tickets) VALUES (%s, %s)
-                     ON CONFLICT (user_id) DO UPDATE SET tickets = lottery_tickets.tickets + %s""",
-                  (uid, qty, qty))
-        c.execute("UPDATE lottery SET jackpot=jackpot+%s WHERE id=1", (cost,))
+        c.execute("INSERT INTO lottery_tickets (user_id,tickets) VALUES (?,?) "
+                  "ON CONFLICT(user_id) DO UPDATE SET tickets=tickets+?", (uid, qty, qty))
+        c.execute("UPDATE lottery SET jackpot=jackpot+? WHERE id=1", (cost,))
         c.execute("SELECT jackpot FROM lottery WHERE id=1")
         jackpot = c.fetchone()["jackpot"]
-
     bot.reply_to(msg,
-        f"🎟 {mention(uid, name)} купил <b>{qty}</b> билетов!\nДжекпот: <b>{fmt(jackpot)} {CURRENCY}</b>",
+        f"🎟 {mention(uid,name)} купил <b>{qty}</b> билетов!\n"
+        f"Джекпот: <b>{fmt(jackpot)} {CUR}</b>",
         parse_mode="HTML")
 
 
-# ── Помощь в группе ────────────────────────
+# Промокод в группе / ЛС
+
+@bot.message_handler(func=lambda m: m.text and
+    re.match(r"^промо\s+\S+", m.text.lower().strip()))
+def cmd_promo(msg):
+    uid  = msg.from_user.id
+    code = msg.text.strip().split(None, 1)[1].strip().upper()
+    ensure_user(uid, msg.from_user.first_name or "")
+    _use_promo(uid, code)
+
+
+# Помощь в группе
 
 @bot.message_handler(func=lambda m: is_group(m) and m.text and
-    m.text.lower().strip() in ["/help","помощь","/помощь"])
+    m.text.lower().strip() in ["/help", "помощь", "/помощь"])
 def group_help(msg):
     bot.send_message(msg.chat.id,
-        "<b>📋 Команды бота</b>\n"
+        "<b>📋 Команды</b>\n"
         "━━━━━━━━━━━━━━━━\n"
-        "<b>Инфо</b>\n"
-        "баланс — твой кошелёк\n"
-        "топ — топ по балансу\n"
-        "топ xp — топ по уровню\n"
-        "акции — текущая цена\n\n"
-        "<b>Игры</b>\n"
-        "рул красное 1000 — рулетка\n"
-        "кости 500 — кубик\n"
-        "слот 1000 — слоты\n"
-        "краш 1000 — краш\n"
-        "дуэль 1000 @username — дуэль\n"
-        "кнб 500 (reply) — камень-ножницы-бумага\n"
-        "лот 3 — купить 3 лотерейных билета\n\n"
-        "<b>Переводы</b>\n"
-        "дать @username 5000\n"
-        "дать 5000 (reply)\n"
-        "чек 5000 — создать чек\n"
-        "активировать КОД\n\n"
-        "<b>Промокод</b>\n"
-        "промо КОД\n\n"
-        "Банк, магазин, клан — в <b>личку</b> → /start",
+        "<b>Инфо</b>\nбаланс · топ · топ xp · акции\n\n"
+        "<b>Игры</b>\nрул красное 1000\nкости 500 · слот 1000\n"
+        "краш 500 · дуэль 1000\nкнб 500 (reply) · лот 3\n\n"
+        "<b>Переводы</b>\nдать @user 500\nдать 500 (reply)\n"
+        "чек 5000 [N] · активировать КОД\n\n"
+        "<b>Другое</b>\nпромо КОД\n\n"
+        "Банк · Биржа · Магазин · Клан — в <b>личку</b> → /start",
         parse_mode="HTML")
 
 
 # ══════════════════════════════════════════════
-# 26. ЗАПУСК
+# 24. АДМИН-КОМАНДЫ
+# ══════════════════════════════════════════════
+
+def adm(fn):
+    def w(msg):
+        if not is_admin(msg.from_user.id): return
+        fn(msg)
+    return w
+
+
+@bot.message_handler(func=lambda m: m.text and m.text.lower().startswith("выдать ") and is_admin(m.from_user.id))
+@adm
+def adm_give(msg):
+    p = msg.text.split()
+    try: uid_, amt = int(p[1]), int(p[2])
+    except: bot.reply_to(msg, "выдать <uid> <сумма>"); return
+    add_balance(uid_, amt)
+    bot.reply_to(msg, f"✅ +{fmt(amt)} → {uid_}")
+
+
+@bot.message_handler(func=lambda m: m.text and m.text.lower().startswith("забрать ") and is_admin(m.from_user.id))
+@adm
+def adm_take(msg):
+    p = msg.text.split()
+    try: uid_, amt = int(p[1]), int(p[2])
+    except: bot.reply_to(msg, "забрать <uid> <сумма>"); return
+    add_balance(uid_, -amt)
+    bot.reply_to(msg, f"✅ -{fmt(amt)} у {uid_}")
+
+
+@bot.message_handler(func=lambda m: m.text and m.text.lower().startswith("бан ") and is_admin(m.from_user.id))
+@adm
+def adm_ban(msg):
+    p = msg.text.split(None, 2)
+    try: uid_ = int(p[1])
+    except: bot.reply_to(msg, "бан <uid> [причина]"); return
+    reason = p[2] if len(p) > 2 else "Нарушение"
+    with db() as c:
+        c.execute("INSERT OR REPLACE INTO bans (user_id,reason,by,ts) VALUES (?,?,?,?)",
+                  (uid_, reason, msg.from_user.id, now()))
+    bot.reply_to(msg, f"🚫 {uid_} заблокирован")
+    try: bot.send_message(uid_, f"🚫 Заблокирован. Причина: {reason}")
+    except: pass
+
+
+@bot.message_handler(func=lambda m: m.text and m.text.lower().startswith("разбан ") and is_admin(m.from_user.id))
+@adm
+def adm_unban(msg):
+    try: uid_ = int(msg.text.split()[1])
+    except: bot.reply_to(msg, "разбан <uid>"); return
+    with db() as c:
+        c.execute("DELETE FROM bans WHERE user_id=?", (uid_,))
+    bot.reply_to(msg, f"✅ {uid_} разблокирован")
+
+
+@bot.message_handler(func=lambda m: m.text and m.text.lower().startswith("промо создать ") and is_admin(m.from_user.id))
+@adm
+def adm_promo(msg):
+    p = msg.text.split()
+    try: code, amt, uses = p[2].upper(), int(p[3]), int(p[4]) if len(p)>4 else 100
+    except: bot.reply_to(msg, "промо создать КОД СУММА [uses]"); return
+    with db() as c:
+        try:
+            c.execute("INSERT INTO promo_codes (code,reward,max_uses) VALUES (?,?,?)", (code,amt,uses))
+        except:
+            bot.reply_to(msg, "❌ Код уже есть"); return
+    bot.reply_to(msg, f"✅ <code>{code}</code> +{fmt(amt)}  uses={uses}", parse_mode="HTML")
+
+
+@bot.message_handler(func=lambda m: m.text and m.text.lower() == "стат" and is_admin(m.from_user.id))
+@adm
+def adm_stat(msg):
+    with db() as c:
+        c.execute("SELECT COUNT(*) FROM users"); users = c.fetchone()[0]
+        c.execute("SELECT COALESCE(SUM(balance),0) FROM users"); bal = c.fetchone()[0]
+        c.execute("SELECT COALESCE(SUM(bank),0) FROM users"); bank = c.fetchone()[0]
+        c.execute("SELECT price FROM stocks WHERE ticker=?", (TICKER,))
+        row = c.fetchone(); price = row["price"] if row else 0
+        c.execute("SELECT jackpot FROM lottery WHERE id=1")
+        lotto = c.fetchone(); jackpot = lotto["jackpot"] if lotto else 0
+        c.execute("SELECT COUNT(*) FROM game_log WHERE ts>?", (now()-86400,)); games24 = c.fetchone()[0]
+    bot.reply_to(msg,
+        f"<b>📊 Статистика</b>\n"
+        f"Игроков: <b>{users}</b>\n"
+        f"В кошельках: <b>{fmt(bal)}</b>\n"
+        f"В банках: <b>{fmt(bank)}</b>\n"
+        f"{TICKER}: <b>{fmt(price)}</b>\n"
+        f"Лото: <b>{fmt(jackpot)}</b>\n"
+        f"Игр за 24ч: <b>{games24}</b>",
+        parse_mode="HTML")
+
+
+@bot.message_handler(func=lambda m: m.text and m.text.lower().startswith("рассылка") and is_admin(m.from_user.id))
+@adm
+def adm_broadcast(msg):
+    text = msg.text[8:].strip()
+    if not text: return
+    with db() as c:
+        c.execute("SELECT id FROM users")
+        uids = [r["id"] for r in c.fetchall()]
+    sent = fail = 0
+    for uid_ in uids:
+        try:
+            bot.send_message(uid_, text, parse_mode="HTML"); sent += 1
+        except: fail += 1
+        time.sleep(0.04)
+    bot.reply_to(msg, f"✅ {sent} отправлено, {fail} ошибок")
+
+
+@bot.message_handler(func=lambda m: m.text and m.text.lower().startswith("дивиденды ") and is_admin(m.from_user.id))
+@adm
+def adm_dividends(msg):
+    try: per_sh = int(msg.text.split()[1])
+    except: bot.reply_to(msg, "дивиденды СУММА_ЗА_АКЦИЮ"); return
+    with db() as c:
+        c.execute("SELECT user_id, shares FROM portfolios WHERE ticker=?", (TICKER,))
+        holders = c.fetchall()
+    total = 0
+    for h in holders:
+        pay = h["shares"] * per_sh
+        add_balance(h["user_id"], pay)
+        total += pay
+        try:
+            bot.send_message(h["user_id"],
+                f"💰 Дивиденды {TICKER}: +{fmt(pay)} {CUR}", parse_mode="HTML")
+        except: pass
+    bot.reply_to(msg, f"✅ Выплачено {fmt(total)} → {len(holders)} держателей")
+    send_alert(f"💰 Дивиденды {TICKER}: {fmt(per_sh)}/акц  итого {fmt(total)}")
+
+
+@bot.message_handler(func=lambda m: m.text and m.text.lower().startswith("добавить товар ") and is_admin(m.from_user.id))
+@adm
+def adm_add_item(msg):
+    # добавить товар 💻 Ноутбук Описание 10000
+    p = msg.text.split(None, 5)
+    try:
+        emoji, name, desc, price = p[2], p[3], p[4], int(p[5].split()[0])
+    except:
+        bot.reply_to(msg, "добавить товар EMOJI ИМЯ ОПИСАНИЕ ЦЕНА"); return
+    with db() as c:
+        c.execute("INSERT INTO items (emoji,name,desc,price) VALUES (?,?,?,?)",
+                  (emoji, name, desc, price))
+    bot.reply_to(msg, f"✅ {emoji} {name} добавлен за {fmt(price)}")
+
+
+# ══════════════════════════════════════════════
+# 25. СОБЫТИЯ — МЕТЕОРЫ / НАЛОГ
+# ══════════════════════════════════════════════
+
+def _events_scheduler():
+    """Случайные события каждые 2-6 часов."""
+    while True:
+        sleep_sec = random.randint(7200, 21600)
+        time.sleep(sleep_sec)
+        try:
+            ev = random.choice(["meteor", "tax"])
+            if ev == "meteor":
+                _do_meteor()
+            elif ev == "tax":
+                _do_tax()
+        except Exception as e:
+            print(f"[events] err: {e}")
+
+
+def _do_meteor():
+    """Пуш метеора — первый забирает монеты."""
+    reward = random.randint(5_000, 30_000)
+    if not ALERT_CHAT: return
+    msg = bot.send_message(ALERT_CHAT,
+        f"☄️ <b>Метеор!</b> Первый поймает <b>{fmt(reward)} {CUR}</b>!\n"
+        f"Нажми кнопку:",
+        parse_mode="HTML",
+        reply_markup=kb([("☄️ Поймать!", f"meteor_{reward}_{now()}")]))
+    # Через 60 сек — истекает
+    def _expire():
+        time.sleep(62)
+        try:
+            bot.edit_message_reply_markup(ALERT_CHAT, msg.message_id, reply_markup=None)
+        except: pass
+    threading.Thread(target=_expire, daemon=True).start()
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("meteor_"))
+def cb_meteor(call):
+    uid    = call.from_user.id
+    parts  = call.data.split("_")
+    reward = int(parts[1])
+    ts     = int(parts[2])
+    if now() - ts > 60:
+        bot.answer_callback_query(call.id, "☄️ Метеор уже упал!"); return
+    ensure_user(uid, call.from_user.first_name or "")
+    add_balance(uid, reward)
+    name = call.from_user.first_name or str(uid)
+    try:
+        bot.edit_message_text(
+            f"☄️ Метеор поймал {mention(uid,name)}! +{fmt(reward)} {CUR}",
+            call.message.chat.id, call.message.message_id, parse_mode="HTML")
+    except: pass
+    bot.answer_callback_query(call.id, f"☄️ +{fmt(reward)} {CUR}!")
+
+
+def _do_tax():
+    """Налог на богатейших игроков."""
+    with db() as c:
+        c.execute("SELECT id, name, balance FROM users WHERE balance>50000 ORDER BY balance DESC LIMIT 20")
+        rich = c.fetchall()
+    if not rich: return
+    total = 0
+    for u in rich:
+        tax = int(u["balance"] * 0.03)
+        if tax > 0:
+            add_balance(u["id"], -tax)
+            total += tax
+            try:
+                bot.send_message(u["id"],
+                    f"💸 Налог на богатство: -{fmt(tax)} {CUR} (3%)", parse_mode="HTML")
+            except: pass
+    if ALERT_CHAT and total > 0:
+        send_alert(f"💸 <b>Налог</b> собран: <b>{fmt(total)} {CUR}</b> с {len(rich)} игроков")
+
+
+# ══════════════════════════════════════════════
+# 26. HISTORY (заглушка из waiting)
+# ══════════════════════════════════════════════
+
+@bot.callback_query_handler(func=lambda c: c.data == "act_tx_hist")
+def cb_tx_hist(call):
+    uid = call.from_user.id
+    with db() as c:
+        c.execute("""SELECT from_id, to_id, amount, fee, ts FROM transfers
+                     WHERE from_id=? OR to_id=? ORDER BY ts DESC LIMIT 10""", (uid, uid))
+        rows = c.fetchall()
+    if not rows:
+        _edit(call, "📜 История пуста.",
+              kb([("👛 Кошелёк", "menu_wallet"), ("🏠 Меню", "home")])); return
+    lines = []
+    for r in rows:
+        dt   = datetime.fromtimestamp(r["ts"]).strftime("%d.%m %H:%M")
+        if r["from_id"] == uid:
+            lines.append(f"🔴 {dt}  -{fmt(r['amount']+r['fee'])}")
+        else:
+            lines.append(f"🟢 {dt}  +{fmt(r['amount'])}")
+    _edit(call, "<b>📜 Переводы</b>\n━━━━━━━━━━━━━━━━━━\n" + "\n".join(lines),
+          kb([("👛 Кошелёк", "menu_wallet"), ("🏠 Меню", "home")]))
+
+
+# ══════════════════════════════════════════════
+# 27. ЗАПУСК
 # ══════════════════════════════════════════════
 
 if __name__ == "__main__":
     init_db()
-
-    threading.Thread(target=_stock_scheduler,  daemon=True).start()
+    threading.Thread(target=_stock_scheduler,   daemon=True).start()
     threading.Thread(target=_lottery_scheduler, daemon=True).start()
-
-    # Устанавливаем webhook
-    if WEBHOOK_URL:
-        bot.remove_webhook()
-        time.sleep(1)
-        bot.set_webhook(url=f"{WEBHOOK_URL}/{TOKEN}")
-        print(f"✅ Webhook установлен: {WEBHOOK_URL}/{TOKEN}")
-    else:
-        print("⚠️ WEBHOOK_URL не задан — используй polling для локального запуска")
-
-    print(f"🚀 Бот запущен на порту {PORT}")
-    app.run(host="0.0.0.0", port=PORT)
+    threading.Thread(target=_events_scheduler,  daemon=True).start()
+    print("🚀 Бот запущен — v3.0 Ultra Clean")
+    bot.infinity_polling(timeout=30, long_polling_timeout=30)
