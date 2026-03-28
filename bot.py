@@ -15,29 +15,64 @@ from telebot.types import (
     InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton,
     LabeledPrice, InlineQueryResultArticle, InputTextMessageContent
 )
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 load_dotenv()
 
 # ═══════════════════════════════════════════════════════════════
-# 0. УДАЛЯЕМ WEBHOOK — ЭТО ВАЖНО!
+# 0. УДАЛЯЕМ WEBHOOK
 # ═══════════════════════════════════════════════════════════════
 
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
 
-# Создаём временный бот только для удаления webhook
+# Временный бот для удаления webhook
 _temp_bot = TeleBot(TOKEN)
 try:
     _temp_bot.delete_webhook()
-    print("✅ Webhook успешно удалён")
+    print("✅ Webhook удалён")
 except Exception as e:
     print(f"⚠️ Ошибка удаления webhook: {e}")
 
-# Теперь создаём основной бот
+# Основной бот
 bot = TeleBot(TOKEN, threaded=True, num_threads=8)
 
 # ═══════════════════════════════════════════════════════════════
-# 1. КОНФИГ
+# 1. HTTP-СЕРВЕР ДЛЯ RENDER (чтобы проходил health check)
+# ═══════════════════════════════════════════════════════════════
+
+PORT = int(os.environ.get("PORT", 8080))
+
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/health" or self.path == "/":
+            self.send_response(200)
+            self.send_header("Content-type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"Bot is running")
+        else:
+            self.send_response(404)
+            self.end_headers()
+    
+    def log_message(self, format, *args):
+        # Отключаем лишние логи
+        pass
+
+def run_http_server():
+    """Запускает минимальный HTTP-сервер для health checks"""
+    try:
+        server = HTTPServer(("0.0.0.0", PORT), HealthCheckHandler)
+        print(f"✅ HTTP-сервер запущен на порту {PORT}")
+        server.serve_forever()
+    except Exception as e:
+        print(f"⚠️ Ошибка HTTP-сервера: {e}")
+
+# Запускаем HTTP-сервер в отдельном потоке
+http_thread = threading.Thread(target=run_http_server, daemon=True)
+http_thread.start()
+
+# ═══════════════════════════════════════════════════════════════
+# 2. КОНФИГ
 # ═══════════════════════════════════════════════════════════════
 
 DB_FILE = "economy.db"
@@ -73,12 +108,8 @@ STOCK_SELL_FEE = 0.03
 STOCK_COOLDOWN = 600
 STOCK_UPDATE_SEC = 1800
 
-# ... остальной код остаётся без изменений ...
-
 # ═══════════════════════════════════════════════════════════════
-
-# ═══════════════════════════════════════════════════════════════
-# 2. БАЗА ДАННЫХ
+# 3. БАЗА ДАННЫХ
 # ═══════════════════════════════════════════════════════════════
 
 class DatabasePool:
@@ -195,6 +226,17 @@ def init_db():
             result      TEXT,
             ts          INTEGER DEFAULT 0
         );
+        CREATE TABLE IF NOT EXISTS stock_trades (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id     INTEGER,
+            ticker      TEXT,
+            action      TEXT,
+            amount      INTEGER,
+            price       INTEGER,
+            fee         INTEGER DEFAULT 0,
+            total       INTEGER,
+            created_at  INTEGER DEFAULT 0
+        );
         CREATE TABLE IF NOT EXISTS promo_codes (
             code    TEXT PRIMARY KEY,
             reward  INTEGER,
@@ -244,7 +286,7 @@ def init_db():
     print("✅ БД инициализирована")
 
 # ═══════════════════════════════════════════════════════════════
-# 3. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# 4. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ═══════════════════════════════════════════════════════════════
 
 def fmt(n: int) -> str:
@@ -289,7 +331,6 @@ def ensure_user(uid: int, name: str = "") -> dict:
     with db() as c:
         c.execute("INSERT OR IGNORE INTO users (id, name, created_at) VALUES (?,?,?)",
                   (uid, name, now()))
-        # Создаём реферальный код если нет
         c.execute("SELECT ref_code FROM users WHERE id=?", (uid,))
         row = c.fetchone()
         if row and not row["ref_code"]:
@@ -308,16 +349,8 @@ def add_xp(uid: int, xp: int):
 def user_level(xp: int) -> int:
     return max(1, int(math.sqrt(xp / 100)) + 1)
 
-def update_game_stats(uid: int, game: str, bet: int, win: int, result: str):
-    with db() as c:
-        c.execute("""
-            INSERT INTO game_history (user_id, game, bet, win, result, ts)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (uid, game, bet, win, result, now()))
-        if win > 0:
-            c.execute("UPDATE users SET games_won=games_won+1, total_won=total_won+? WHERE id=?", (win, uid))
-        else:
-            c.execute("UPDATE users SET games_lost=games_lost+1, total_lost=total_lost+? WHERE id=?", (bet, uid))
+def level_xp(lvl: int) -> int:
+    return (lvl - 1) ** 2 * 100
 
 def parse_bet(text: str, balance: int) -> int | None:
     text = text.lower().strip().replace(" ", "")
@@ -334,14 +367,8 @@ def parse_bet(text: str, balance: int) -> int | None:
     except:
         return None
 
-def get_display_name(uid: int) -> str:
-    u = get_user(uid)
-    if u and u.get("name"):
-        return u["name"]
-    return str(uid)
-
 # ═══════════════════════════════════════════════════════════════
-# 4. КЛАВИАТУРЫ
+# 5. КЛАВИАТУРЫ
 # ═══════════════════════════════════════════════════════════════
 
 def main_menu() -> ReplyKeyboardMarkup:
@@ -375,10 +402,8 @@ def games_menu() -> ReplyKeyboardMarkup:
     return markup
 
 # ═══════════════════════════════════════════════════════════════
-# 5. ОСНОВНЫЕ КОМАНДЫ
+# 6. ОСНОВНЫЕ КОМАНДЫ
 # ═══════════════════════════════════════════════════════════════
-
-bot = TeleBot(TOKEN, threaded=True, num_threads=8)
 
 @bot.message_handler(commands=["start", "меню"])
 def cmd_start(msg):
@@ -386,7 +411,6 @@ def cmd_start(msg):
     name = msg.from_user.first_name or "Игрок"
     ensure_user(uid, name)
     
-    # Обработка реферальной ссылки
     parts = msg.text.split()
     if len(parts) > 1:
         ref = parts[1]
@@ -413,83 +437,8 @@ def cmd_start(msg):
 def back_to_menu(msg):
     bot.send_message(msg.chat.id, "Главное меню:", reply_markup=main_menu(), parse_mode="HTML")
 
-@bot.message_handler(func=lambda m: m.text == "👤 Профиль")
-def cmd_profile(msg):
-    uid = msg.from_user.id
-    u = get_user(uid)
-    if not u:
-        return
-    
-    lvl = user_level(u["xp"])
-    prem = is_premium(uid)
-    prem_tag = " ⭐" if prem else ""
-    
-    wins = u.get("games_won", 0)
-    losses = u.get("games_lost", 0)
-    total_games = wins + losses
-    winrate = (wins / total_games * 100) if total_games > 0 else 0
-    
-    # Реферальная статистика
-    with db() as c:
-        c.execute("SELECT COUNT(*) FROM users WHERE ref_by=?", (uid,))
-        refs = c.fetchone()[0]
-    
-    text = (
-        f"<b>👤 Профиль</b>{prem_tag}\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"Имя: <b>{u['name'] or 'Игрок'}</b>\n"
-        f"ID: <code>{uid}</code>\n"
-        f"Уровень: <b>{lvl}</b>\n"
-        f"Опыт: <b>{fmt(u['xp'])}</b>\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"💰 Баланс: <b>{fmt(u['balance'])} {CURRENCY}</b>\n"
-        f"🏦 В банке: <b>{fmt(u['bank'])} {CURRENCY}</b>\n"
-        f"🎮 Игры: {wins} побед / {losses} поражений ({winrate:.1f}%)\n"
-        f"🏆 Выиграно: <b>{fmt(u.get('total_won', 0))}</b>\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"🔗 Приглашено: {refs} игроков\n"
-        f"📦 Видеокарт: {u.get('video_cards', 0)}"
-    )
-    bot.send_message(uid, text, parse_mode="HTML")
-
-@bot.message_handler(func=lambda m: m.text == "💰 Баланс")
-def cmd_balance(msg):
-    uid = msg.from_user.id
-    u = get_user(uid)
-    if not u:
-        return
-    
-    lvl = user_level(u["xp"])
-    next_lvl = level_xp(lvl + 1)
-    current_lvl_xp = level_xp(lvl)
-    progress = int((u["xp"] - current_lvl_xp) / (next_lvl - current_lvl_xp) * 10) if next_lvl > current_lvl_xp else 10
-    bar = "█" * progress + "░" * (10 - progress)
-    
-    text = (
-        f"<b>💰 Баланс</b>\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"💵 Кошелёк: <b>{fmt(u['balance'])} {CURRENCY}</b>\n"
-        f"🏦 Депозит: <b>{fmt(u['bank'])} {CURRENCY}</b>\n"
-        f"📊 Капитал: <b>{fmt(u['balance'] + u['bank'])}</b>\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"⚡ Уровень {lvl} [{bar}]\n"
-        f"⭐ Опыт: {fmt(u['xp'])} / {fmt(next_lvl)}"
-    )
-    bot.send_message(uid, text, parse_mode="HTML")
-
-def level_xp(lvl: int) -> int:
-    return (lvl - 1) ** 2 * 100
-
-@bot.message_handler(func=lambda m: m.text == "⚒️ Работа")
-def cmd_work(msg):
-    uid = msg.from_user.id
-    ensure_user(uid, msg.from_user.first_name or "")
-    
-    text = "<b>⚒️ Работа</b>\n\nВыбери способ заработка:"
-    bot.send_message(uid, text, reply_markup=work_menu(), parse_mode="HTML")
-
 # ═══════════════════════════════════════════════════════════════
-# 6. КЛИКЕР
+# 7. КЛИКЕР
 # ═══════════════════════════════════════════════════════════════
 
 @bot.message_handler(func=lambda m: m.text == "👆 Кликер")
@@ -504,7 +453,6 @@ def cmd_click(msg):
         bot.send_message(uid, f"⏱ Клик через: <b>{cd_str(remaining)}</b>", parse_mode="HTML")
         return
     
-    # Бонус от уровня
     lvl = user_level(u["xp"])
     power = CLICK_BASE + lvl * 5
     earn = power + random.randint(-20, 50)
@@ -520,7 +468,7 @@ def cmd_click(msg):
     bot.send_message(uid, text, parse_mode="HTML")
 
 # ═══════════════════════════════════════════════════════════════
-# 7. МАЙНИНГ
+# 8. МАЙНИНГ
 # ═══════════════════════════════════════════════════════════════
 
 @bot.message_handler(func=lambda m: m.text == "⛏️ Майнинг")
@@ -553,7 +501,6 @@ def cmd_mine(msg):
     )
     bot.send_message(uid, text, parse_mode="HTML")
     
-    # Предложение купить карту
     card_price = 5000 * (2 ** cards)
     if u["balance"] >= card_price:
         markup = InlineKeyboardMarkup()
@@ -582,7 +529,7 @@ def cb_buy_card(call):
     bot.answer_callback_query(call.id, f"✅ Куплена видеокарта! Теперь у тебя {cards + 1} карт(ы)")
 
 # ═══════════════════════════════════════════════════════════════
-# 8. ТАКСИ
+# 9. ТАКСИ
 # ═══════════════════════════════════════════════════════════════
 
 TAXI_ROUTES = [
@@ -611,7 +558,6 @@ def cmd_taxi(msg):
         return
     
     route = random.choice(TAXI_ROUTES)
-    # Бонус за уровень
     u = get_user(uid)
     lvl = user_level(u["xp"])
     earn = int(route["base"] * random.uniform(0.9, 1.2) * (1 + lvl * 0.01))
@@ -632,7 +578,6 @@ def cmd_taxi(msg):
     )
     bot.send_message(uid, text, parse_mode="HTML")
     
-    # Авто-завершение
     def finish():
         time.sleep(route["time"] * 60)
         if uid in active_rides:
@@ -654,7 +599,6 @@ def cmd_finish_ride(msg):
         elapsed = now() - data["start"]
         time_spent = elapsed / 60
         
-        # Бонус за досрочное завершение
         if time_spent < data["time"]:
             bonus = int(data["earn"] * (1 - time_spent / data["time"]) * 0.3)
             total = data["earn"] + bonus
@@ -670,55 +614,8 @@ def cmd_finish_ride(msg):
         bot.send_message(uid, "❌ У тебя нет активной поездки", parse_mode="HTML")
 
 # ═══════════════════════════════════════════════════════════════
-# 9. ИГРЫ
+# 10. ИГРЫ — КОСТИ
 # ═══════════════════════════════════════════════════════════════
-
-@bot.message_handler(func=lambda m: m.text == "🎰 Игры")
-def cmd_games(msg):
-    text = get_games_help()
-    bot.send_message(msg.chat.id, text, reply_markup=games_menu(), parse_mode="HTML")
-
-def get_games_help():
-    return """<b>🎲 ДОСТУПНЫЕ ИГРЫ</b>
-
-<b>🎲 Кости</b> — <code>кости [сумма] [тип]</code>
-Типы: 1-6, малые, большие, чет, нечет
-
-<b>🎰 Слоты</b> — <code>слоты [сумма]</code>
-Выигрыш до x100!
-
-<b>🎯 Дартс</b> — <code>дартс [сумма]</code>
-Яблочко x5, кольцо возврат ставки
-
-<b>🎳 Боулинг</b> — <code>боулинг [сумма]</code>
-Страйк x3, спэр x1.5
-
-<b>🏀 Баскетбол</b> — <code>баскетбол [сумма]</code>
-Попадание x2.5
-
-<b>⚽ Футбол</b> — <code>футбол [сумма]</code>
-Гол x2
-
-<b>🎡 Рулетка</b> — <code>рулетка [сумма] [цвет/число]</code>
-Цвета: красное/чёрное/зеленое (x2/x36)
-
-<b>💣 Мины</b> — <code>мины [сумма] [количество]</code>
-Открывай клетки, избегая мин
-
-<b>🎲 Краш</b> — <code>краш [сумма] [множитель]</code>
-Пример: краш 1000 2.5
-
-<b>🎟️ Лотерея</b> — <code>лотерея [сумма]</code>
-Купить билеты на розыгрыш
-
-💡 Примеры:
-<code>кости 1000 чет</code>
-<code>слоты 5000</code>
-<code>дартс 2000</code>
-<code>рулетка 1000 красное</code>
-<code>мины 5000 3</code>"""
-
-# ── Кости ──────────────────────────────────────────────────
 
 @bot.message_handler(func=lambda m: m.text and m.text.lower().startswith("кости"))
 def cmd_dice(msg):
@@ -763,16 +660,16 @@ def cmd_dice(msg):
     if win:
         win_amount = bet * multiplier
         update_balance(uid, win_amount - bet)
-        update_game_stats(uid, "кости", bet, win_amount, "win")
         text = f"🎲 <b>Выпало {result}!</b> Победа! +{fmt(win_amount - bet)} {CURRENCY}"
     else:
         update_balance(uid, -bet)
-        update_game_stats(uid, "кости", bet, 0, "lose")
         text = f"🎲 <b>Выпало {result}!</b> Проигрыш. -{fmt(bet)} {CURRENCY}"
     
     bot.send_message(uid, text, parse_mode="HTML")
 
-# ── Слоты ──────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+# 11. СЛОТЫ
+# ═══════════════════════════════════════════════════════════════
 
 SLOT_SYMBOLS = ["🍒", "🍋", "🍊", "🍇", "⭐", "💎", "🔔", "7️⃣"]
 SLOT_PAYOUTS = {
@@ -802,16 +699,16 @@ def cmd_slots(msg):
     if mult:
         win = int(bet * mult)
         update_balance(uid, win - bet)
-        update_game_stats(uid, "слоты", bet, win, "win")
         text = f"🎰 {combo}\n🎉 Джекпот x{mult}! +{fmt(win - bet)} {CURRENCY}"
     else:
         update_balance(uid, -bet)
-        update_game_stats(uid, "слоты", bet, 0, "lose")
         text = f"🎰 {combo}\n😔 Нет совпадений. -{fmt(bet)} {CURRENCY}"
     
     bot.send_message(uid, text, parse_mode="HTML")
 
-# ── Дартс ──────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+# 12. ДАРТС
+# ═══════════════════════════════════════════════════════════════
 
 @bot.message_handler(func=lambda m: m.text and m.text.lower().startswith("дартс"))
 def cmd_darts(msg):
@@ -833,20 +730,18 @@ def cmd_darts(msg):
     if result == 6:
         win = bet * 5
         update_balance(uid, win - bet)
-        update_game_stats(uid, "дартс", bet, win, "win")
         text = f"🎯 <b>ЯБЛОЧКО!</b> +{fmt(win - bet)} {CURRENCY}"
     elif result in [4, 5]:
-        update_balance(uid, 0)
-        update_game_stats(uid, "дартс", bet, 0, "draw")
         text = f"🎯 Попадание в кольцо! Ставка возвращена."
     else:
         update_balance(uid, -bet * 2)
-        update_game_stats(uid, "дартс", bet, 0, "lose")
         text = f"💥 ПРОМАХ! -{fmt(bet * 2)} {CURRENCY}"
     
     bot.send_message(uid, text, parse_mode="HTML")
 
-# ── Боулинг ──────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+# 13. БОУЛИНГ
+# ═══════════════════════════════════════════════════════════════
 
 @bot.message_handler(func=lambda m: m.text and m.text.lower().startswith("боулинг"))
 def cmd_bowling(msg):
@@ -868,25 +763,22 @@ def cmd_bowling(msg):
     if result == 6:
         win = bet * 3
         update_balance(uid, win - bet)
-        update_game_stats(uid, "боулинг", bet, win, "win")
         text = f"🎳 <b>СТРАЙК!</b> x3! +{fmt(win - bet)} {CURRENCY}"
     elif result == 5:
         win = int(bet * 1.5)
         update_balance(uid, win - bet)
-        update_game_stats(uid, "боулинг", bet, win, "win")
         text = f"🎳 Спэр! x1.5! +{fmt(win - bet)} {CURRENCY}"
     elif result >= 3:
-        update_balance(uid, 0)
-        update_game_stats(uid, "боулинг", bet, 0, "draw")
         text = f"🎳 9 кеглей! Ставка возвращена."
     else:
         update_balance(uid, -bet)
-        update_game_stats(uid, "боулинг", bet, 0, "lose")
         text = f"🎳 Промах! -{fmt(bet)} {CURRENCY}"
     
     bot.send_message(uid, text, parse_mode="HTML")
 
-# ── Баскетбол ──────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+# 14. БАСКЕТБОЛ
+# ═══════════════════════════════════════════════════════════════
 
 @bot.message_handler(func=lambda m: m.text and m.text.lower().startswith("баскетбол"))
 def cmd_basketball(msg):
@@ -908,16 +800,16 @@ def cmd_basketball(msg):
     if result in [4, 5]:
         win = int(bet * 2.5)
         update_balance(uid, win - bet)
-        update_game_stats(uid, "баскетбол", bet, win, "win")
         text = f"🏀 <b>ПОПАДАНИЕ!</b> x2.5! +{fmt(win - bet)} {CURRENCY}"
     else:
         update_balance(uid, -bet)
-        update_game_stats(uid, "баскетбол", bet, 0, "lose")
         text = f"🏀 Промах! -{fmt(bet)} {CURRENCY}"
     
     bot.send_message(uid, text, parse_mode="HTML")
 
-# ── Футбол ──────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+# 15. ФУТБОЛ
+# ═══════════════════════════════════════════════════════════════
 
 @bot.message_handler(func=lambda m: m.text and m.text.lower().startswith("футбол"))
 def cmd_football(msg):
@@ -939,18 +831,16 @@ def cmd_football(msg):
     if result in [3, 4]:
         win = bet * 2
         update_balance(uid, win - bet)
-        update_game_stats(uid, "футбол", bet, win, "win")
         text = f"⚽ <b>ГОЛ!</b> x2! +{fmt(win - bet)} {CURRENCY}"
     else:
         update_balance(uid, -bet)
-        update_game_stats(uid, "футбол", bet, 0, "lose")
         text = f"⚽ Мимо! -{fmt(bet)} {CURRENCY}"
     
     bot.send_message(uid, text, parse_mode="HTML")
 
-# ── Краш ──────────────────────────────────────────────────
-
-crash_games = {}
+# ═══════════════════════════════════════════════════════════════
+# 16. КРАШ
+# ═══════════════════════════════════════════════════════════════
 
 @bot.message_handler(func=lambda m: m.text and m.text.lower().startswith("краш"))
 def cmd_crash(msg):
@@ -985,15 +875,15 @@ def cmd_crash(msg):
     if crash_at > target_mult:
         win = int(bet * target_mult)
         update_balance(uid, win)
-        update_game_stats(uid, "краш", bet, win, "win")
         text = f"🎲 <b>КРАШ НА {crash_at:.2f}x!</b>\n💰 Твой множитель: {target_mult}x\n✅ Выигрыш: +{fmt(win)} {CURRENCY}"
     else:
-        update_game_stats(uid, "краш", bet, 0, "lose")
         text = f"💥 <b>КРАШ НА {crash_at:.2f}x!</b>\n📉 Твой множитель: {target_mult}x\n❌ Проигрыш: -{fmt(bet)} {CURRENCY}"
     
     bot.send_message(uid, text, parse_mode="HTML")
 
-# ── Рулетка ──────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+# 17. РУЛЕТКА
+# ═══════════════════════════════════════════════════════════════
 
 RED_NUMBERS = [1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36]
 
@@ -1039,16 +929,16 @@ def cmd_roulette(msg):
     if win:
         win_amount = bet * multiplier
         update_balance(uid, win_amount - bet)
-        update_game_stats(uid, "рулетка", bet, win_amount, "win")
         text = f"🎡 <b>Выпало {color}{result}</b>\n🎉 Победа! +{fmt(win_amount - bet)} {CURRENCY}"
     else:
         update_balance(uid, -bet)
-        update_game_stats(uid, "рулетка", bet, 0, "lose")
         text = f"🎡 <b>Выпало {color}{result}</b>\n😔 Проигрыш. -{fmt(bet)} {CURRENCY}"
     
     bot.send_message(uid, text, parse_mode="HTML")
 
-# ── Мины ──────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+# 18. МИНЫ
+# ═══════════════════════════════════════════════════════════════
 
 mines_games = {}
 
@@ -1076,7 +966,6 @@ def cmd_mines(msg):
         bot.send_message(uid, "❌ Укажи количество мин", parse_mode="HTML")
         return
     
-    # Создаём поле 5x5
     total_cells = 25
     mine_positions = random.sample(range(total_cells), mines_count)
     
@@ -1084,7 +973,6 @@ def cmd_mines(msg):
         "bet": bet,
         "mines": mine_positions,
         "opened": [],
-        "multiplier": 1.0
     }
     
     update_balance(uid, -bet)
@@ -1100,7 +988,6 @@ def show_mines_board(uid: int, chat_id: int):
     
     text = f"💣 <b>Мины</b> | Ставка: {fmt(game['bet'])} | Открыто: {len(game['opened'])}/25\n💰 Потенциал: {fmt(potential)}"
     
-    # Создаём клавиатуру 5x5
     markup = InlineKeyboardMarkup()
     for i in range(0, 25, 5):
         row = []
@@ -1140,8 +1027,6 @@ def cb_mines_open(call):
         return
     
     if cell in game["mines"]:
-        # Проигрыш
-        update_game_stats(uid, "мины", game["bet"], 0, "lose")
         bot.edit_message_text(f"💥 <b>БУМ!</b> Ты наступил на мину!\nПотеряно: {fmt(game['bet'])} {CURRENCY}",
                               call.message.chat.id, call.message.message_id, parse_mode="HTML")
         del mines_games[uid]
@@ -1151,11 +1036,9 @@ def cb_mines_open(call):
     game["opened"].append(cell)
     
     if len(game["opened"]) >= 20:
-        # Победа
         mult = 1.0 + len(game["opened"]) * 0.2
         win = int(game["bet"] * mult)
         update_balance(uid, win)
-        update_game_stats(uid, "мины", game["bet"], win, "win")
         bot.edit_message_text(f"🎉 <b>ПОБЕДА!</b>\nТы открыл {len(game['opened'])} клеток!\n+{fmt(win)} {CURRENCY}",
                               call.message.chat.id, call.message.message_id, parse_mode="HTML")
         del mines_games[uid]
@@ -1182,7 +1065,6 @@ def cb_mines_cashout(call):
     mult = 1.0 + len(game["opened"]) * 0.2
     win = int(game["bet"] * mult)
     update_balance(uid, win)
-    update_game_stats(uid, "мины", game["bet"], win, "win")
     
     bot.edit_message_text(f"💰 <b>Выигрыш!</b>\n+{fmt(win)} {CURRENCY} (x{mult:.1f})",
                           call.message.chat.id, call.message.message_id, parse_mode="HTML")
@@ -1203,7 +1085,6 @@ def cb_mines_exit(call):
         return
     
     update_balance(uid, game["bet"])
-    update_game_stats(uid, "мины", game["bet"], 0, "exit")
     bot.edit_message_text(f"🏃‍♂️ Выход из игры\nВозвращено: {fmt(game['bet'])} {CURRENCY}",
                           call.message.chat.id, call.message.message_id, parse_mode="HTML")
     bot.answer_callback_query(call.id, "✅ Возвращено")
@@ -1212,7 +1093,9 @@ def cb_mines_exit(call):
 def cb_mines_no(call):
     bot.answer_callback_query(call.id)
 
-# ── Лотерея ──────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+# 19. ЛОТЕРЕЯ
+# ═══════════════════════════════════════════════════════════════
 
 LOTTERY_TICKET_PRICE = 500
 
@@ -1249,7 +1132,6 @@ def cmd_lottery(msg):
     bot.send_message(uid, f"🎟️ Куплено <b>{tickets}</b> билетов!\n💰 Джекпот: {fmt(jackpot)} {CURRENCY}", parse_mode="HTML")
 
 def lottery_scheduler():
-    """Розыгрыш лотереи раз в сутки"""
     while True:
         time.sleep(86400)
         try:
@@ -1280,13 +1162,11 @@ def lottery_scheduler():
                     bot.send_message(winner, f"🎉 <b>ВЫ ВЫИГРАЛИ ЛОТЕРЕЮ!</b>\n+{fmt(jackpot)} {CURRENCY}", parse_mode="HTML")
                 except:
                     pass
-                
-                print(f"[lottery] победитель: {winner}, выигрыш: {jackpot}")
         except Exception as e:
             print(f"[lottery] ошибка: {e}")
 
 # ═══════════════════════════════════════════════════════════════
-# 10. БАНК
+# 20. БАНК
 # ═══════════════════════════════════════════════════════════════
 
 @bot.message_handler(func=lambda m: m.text == "🏦 Банк")
@@ -1294,7 +1174,6 @@ def cmd_bank(msg):
     uid = msg.from_user.id
     u = get_user(uid)
     
-    # Проверка кредита
     with db() as c:
         c.execute("SELECT amount, due_at FROM loans WHERE user_id=?", (uid,))
         loan = c.fetchone()
@@ -1316,7 +1195,7 @@ def cmd_bank(msg):
         f"<code>вклад 5000</code> — положить\n"
         f"<code>снять 3000</code> — снять\n"
         f"<code>кредит 10000</code> — взять кредит\n"
-        f"<code>погасить 5000</code> — погасить долг"
+        f"<code>погасить 5000</code> — погасить"
     )
     bot.send_message(uid, text, parse_mode="HTML")
 
@@ -1362,7 +1241,9 @@ def cmd_withdraw(msg):
     
     bot.send_message(uid, f"✅ Снято с депозита: <b>{fmt(amount)} {CURRENCY}</b>", parse_mode="HTML")
 
-# ── Кредит ──────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+# 21. КРЕДИТ
+# ═══════════════════════════════════════════════════════════════
 
 @bot.message_handler(func=lambda m: m.text and m.text.lower().startswith("кредит "))
 def cmd_loan(msg):
@@ -1441,7 +1322,7 @@ def cmd_repay(msg):
             bot.send_message(uid, f"✅ Погашено: {fmt(pay)} {CURRENCY}\nОстаток: {fmt(new_debt)}", parse_mode="HTML")
 
 # ═══════════════════════════════════════════════════════════════
-# 11. БИРЖА
+# 22. БИРЖА
 # ═══════════════════════════════════════════════════════════════
 
 def get_stock_price():
@@ -1509,7 +1390,6 @@ def cmd_buy_stock(msg):
     total = price * qty
     u = get_user(uid)
     
-    # Проверка кулдауна
     with db() as c:
         c.execute("SELECT last_trade FROM stock_portfolio WHERE user_id=? AND ticker=?", (uid, TICKER))
         row = c.fetchone()
@@ -1541,6 +1421,9 @@ def cmd_buy_stock(msg):
                 avg_buy = ?,
                 last_trade = ?
         """, (uid, TICKER, qty, new_avg, now(), qty, new_avg, now()))
+        
+        c.execute("INSERT INTO stock_trades (user_id, ticker, action, amount, price, total, created_at) VALUES (?,?,?,?,?,?,?)",
+                  (uid, TICKER, "buy", qty, price, total, now()))
     
     update_balance(uid, -total)
     update_stock_price(0.0005 * qty)
@@ -1572,7 +1455,6 @@ def cmd_sell_stock(msg):
             bot.send_message(uid, f"❌ У тебя {port['shares'] if port else 0} акций", parse_mode="HTML")
             return
         
-        # Проверка кулдауна
         if port["last_trade"] > 0:
             cd_left = STOCK_COOLDOWN - (now() - port["last_trade"])
             if cd_left > 0:
@@ -1591,6 +1473,9 @@ def cmd_sell_stock(msg):
         else:
             c.execute("UPDATE stock_portfolio SET shares=?, last_trade=? WHERE user_id=? AND ticker=?", 
                       (new_shares, now(), uid, TICKER))
+        
+        c.execute("INSERT INTO stock_trades (user_id, ticker, action, amount, price, fee, total, created_at) VALUES (?,?,?,?,?,?,?,?)",
+                  (uid, TICKER, "sell", qty, price, fee, net, now()))
     
     update_stock_price(-0.0005 * qty)
     
@@ -1620,7 +1505,6 @@ def cmd_stock_history(msg):
         else:
             lines.append(f"⬜ {dt}  <b>{fmt(price)}</b>")
     
-    # Мои сделки
     with db() as c:
         c.execute("SELECT action, amount, price, created_at FROM stock_trades WHERE user_id=? ORDER BY created_at DESC LIMIT 5", (uid,))
         trades = c.fetchall()
@@ -1638,7 +1522,7 @@ def cmd_stock_history(msg):
     bot.send_message(uid, text, parse_mode="HTML")
 
 # ═══════════════════════════════════════════════════════════════
-# 12. БОНУС
+# 23. БОНУС
 # ═══════════════════════════════════════════════════════════════
 
 @bot.message_handler(func=lambda m: m.text == "🎁 Бонус")
@@ -1674,7 +1558,7 @@ def cmd_bonus(msg):
     bot.send_message(uid, text, parse_mode="HTML")
 
 # ═══════════════════════════════════════════════════════════════
-# 13. ТОП
+# 24. ТОП
 # ═══════════════════════════════════════════════════════════════
 
 @bot.message_handler(func=lambda m: m.text == "🏆 Топ")
@@ -1692,7 +1576,6 @@ def cmd_top(msg):
         name = row["name"] or f"Игрок"
         text += f"{medals[i]} {name} — <b>{fmt(row['balance'])}</b>\n"
     
-    # Моя позиция
     with db() as c:
         c.execute("SELECT COUNT(*) + 1 FROM users WHERE balance > (SELECT balance FROM users WHERE id=?)", (uid,))
         pos = c.fetchone()[0]
@@ -1702,7 +1585,7 @@ def cmd_top(msg):
     bot.send_message(uid, text, parse_mode="HTML")
 
 # ═══════════════════════════════════════════════════════════════
-# 14. ПЕРЕВОДЫ
+# 25. ПЕРЕВОДЫ
 # ═══════════════════════════════════════════════════════════════
 
 @bot.message_handler(func=lambda m: m.text and m.text.lower().startswith("перевод"))
@@ -1722,7 +1605,6 @@ def cmd_transfer(msg):
         bot.send_message(uid, "❌ Неверная сумма", parse_mode="HTML")
         return
     
-    # Поиск пользователя
     with db() as c:
         if target.isdigit():
             c.execute("SELECT id, name FROM users WHERE id=?", (int(target),))
@@ -1747,7 +1629,6 @@ def cmd_transfer(msg):
         bot.send_message(uid, f"❌ Нужно {fmt(total)} (включая комиссию {fmt(fee)})", parse_mode="HTML")
         return
     
-    # Проверка кулдауна
     if now() - u.get("last_transfer", 0) < CD_TRANSFER:
         bot.send_message(uid, f"⏱ Подожди {CD_TRANSFER} сек между переводами", parse_mode="HTML")
         return
@@ -1768,7 +1649,7 @@ def cmd_transfer(msg):
         pass
 
 # ═══════════════════════════════════════════════════════════════
-# 15. РЕФЕРАЛ
+# 26. РЕФЕРАЛ
 # ═══════════════════════════════════════════════════════════════
 
 @bot.message_handler(func=lambda m: m.text == "🔗 Реферал")
@@ -1798,7 +1679,7 @@ def cmd_referral(msg):
     bot.send_message(uid, text, parse_mode="HTML")
 
 # ═══════════════════════════════════════════════════════════════
-# 16. ДОНАТ
+# 27. ДОНАТ
 # ═══════════════════════════════════════════════════════════════
 
 DONATE_PACKAGES = {
@@ -1861,7 +1742,7 @@ def successful_payment(msg):
         bot.send_message(uid, f"✅ Пополнение на <b>{fmt(pkg['amount'])} {CURRENCY}</b>", parse_mode="HTML")
 
 # ═══════════════════════════════════════════════════════════════
-# 17. ПРОМОКОДЫ
+# 28. ПРОМОКОДЫ
 # ═══════════════════════════════════════════════════════════════
 
 @bot.message_handler(func=lambda m: m.text and m.text.lower().startswith("промо "))
@@ -1918,7 +1799,7 @@ def cmd_create_promo(msg):
     bot.reply_to(msg, f"✅ Промокод <code>{code}</code> создан\n+{fmt(reward)}, {uses} использований", parse_mode="HTML")
 
 # ═══════════════════════════════════════════════════════════════
-# 18. ЧЕКИ
+# 29. ЧЕКИ
 # ═══════════════════════════════════════════════════════════════
 
 @bot.message_handler(func=lambda m: m.text and m.text.lower().startswith("чек "))
@@ -1990,7 +1871,7 @@ def cmd_activate_check(msg):
     bot.send_message(uid, f"✅ Чек активирован!\n+{fmt(check['amount'])} {CURRENCY}", parse_mode="HTML")
 
 # ═══════════════════════════════════════════════════════════════
-# 19. ПОМОЩЬ
+# 30. ПОМОЩЬ
 # ═══════════════════════════════════════════════════════════════
 
 @bot.message_handler(func=lambda m: m.text == "📞 Помощь")
@@ -2038,7 +1919,7 @@ def cmd_help(msg):
     bot.send_message(msg.chat.id, text, parse_mode="HTML")
 
 # ═══════════════════════════════════════════════════════════════
-# 20. АДМИН-КОМАНДЫ
+# 31. АДМИН-КОМАНДЫ
 # ═══════════════════════════════════════════════════════════════
 
 @bot.message_handler(func=lambda m: m.text and m.text.lower().startswith("выдать ") and is_admin(m.from_user.id))
@@ -2170,7 +2051,7 @@ def cmd_active(msg):
     bot.send_message(msg.chat.id, f"📊 Активность за сутки: {daily}/{total} ({daily/total*100:.1f}%)", parse_mode="HTML")
 
 # ═══════════════════════════════════════════════════════════════
-# 21. ЗАПУСК
+# 32. ЗАПУСК
 # ═══════════════════════════════════════════════════════════════
 
 def stock_scheduler():
@@ -2190,9 +2071,6 @@ def interest_scheduler():
         except Exception as e:
             print(f"[interest] ошибка: {e}")
 
-# ЗАПУСК
-# ═══════════════════════════════════════════════════════════════
-
 if __name__ == "__main__":
     init_db()
     
@@ -2201,5 +2079,4 @@ if __name__ == "__main__":
     threading.Thread(target=lottery_scheduler, daemon=True).start()
     
     print("🚀 Бот запущен")
-    # infinity_polling уже использует polling, webhook удалён выше
     bot.infinity_polling(timeout=30, long_polling_timeout=30)
