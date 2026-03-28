@@ -394,7 +394,7 @@ def games_menu() -> ReplyKeyboardMarkup:
     markup = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     buttons = [
         "🎲 Кости", "🎰 Слоты", "🎯 Дартс", "🎳 Боулинг",
-        "🏀 Баскетбол", "⚽ Футбол", "🎲 Краш", "🎡 Рулетка",
+        "🏀 Баскетбол", "⚽ Футбол", "🚀 Краш", "🎡 Рулетка",
         "💣 Мины", "🎟️ Лотерея", "🏠 Главное меню"
     ]
     for btn in buttons:
@@ -437,11 +437,86 @@ def cmd_start(msg):
 def back_to_menu(msg):
     bot.send_message(msg.chat.id, "Главное меню:", reply_markup=main_menu(), parse_mode="HTML")
 
+@bot.message_handler(func=lambda m: m.text == "👤 Профиль")
+def cmd_profile(msg):
+    uid = msg.from_user.id
+    u = get_user(uid)
+    if not u:
+        ensure_user(uid, msg.from_user.first_name or "Игрок")
+        u = get_user(uid)
+    lvl = user_level(u["xp"])
+    xp_cur = u["xp"] - level_xp(lvl)
+    xp_need = level_xp(lvl + 1) - level_xp(lvl)
+    bar_filled = int((xp_cur / max(1, xp_need)) * 10)
+    bar = "▓" * bar_filled + "░" * (10 - bar_filled)
+    prem = "💎 Премиум" if is_premium(uid) else "👤 Обычный"
+    created = datetime.fromtimestamp(u["created_at"]).strftime("%d.%m.%Y") if u["created_at"] else "—"
+    text = (
+        f"<b>👤 Профиль — {u['name'] or 'Игрок'}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🎖 Уровень: <b>{lvl}</b>  [{bar}]\n"
+        f"⭐ Опыт: {fmt(u['xp'])} | До {lvl+1} ур.: {fmt(max(0, xp_need - xp_cur))}\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"💰 Баланс: <b>{fmt(u['balance'])} {CURRENCY}</b>\n"
+        f"🏦 Депозит: {fmt(u['bank'])} {CURRENCY}\n"
+        f"📈 Заработано: {fmt(u['total_earned'])} {CURRENCY}\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🎮 Побед: {u['games_won']} | Поражений: {u['games_lost']}\n"
+        f"🔥 Стрик бонуса: {u['daily_streak']} дней\n"
+        f"🖥 Видеокарт: {u['video_cards']}\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"{prem}\n"
+        f"📅 В игре с: {created}"
+    )
+    bot.send_message(uid, text, parse_mode="HTML")
+
+@bot.message_handler(func=lambda m: m.text == "💰 Баланс")
+def cmd_balance(msg):
+    uid = msg.from_user.id
+    u = get_user(uid)
+    if not u:
+        ensure_user(uid, msg.from_user.first_name or "Игрок")
+        u = get_user(uid)
+    with db() as c:
+        c.execute("SELECT amount FROM loans WHERE user_id=?", (uid,))
+        loan = c.fetchone()
+    loan_text = f"\n⚠️ Кредит: <b>{fmt(loan['amount'])} {CURRENCY}</b>" if loan and loan["amount"] > 0 else ""
+    text = (
+        f"<b>💰 Баланс</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"👛 Кошелёк: <b>{fmt(u['balance'])} {CURRENCY}</b>\n"
+        f"🏦 Депозит: {fmt(u['bank'])} {CURRENCY}\n"
+        f"💎 Всего: {fmt(u['balance'] + u['bank'])} {CURRENCY}"
+        f"{loan_text}"
+    )
+    bot.send_message(uid, text, parse_mode="HTML")
+
 # ═══════════════════════════════════════════════════════════════
 # 7. КЛИКЕР
 # ═══════════════════════════════════════════════════════════════
 
-@bot.message_handler(func=lambda m: m.text == "👆 Кликер")
+@bot.message_handler(func=lambda m: m.text == "⚒️ Работа")
+def cmd_work_menu(msg):
+    bot.send_message(msg.chat.id, "⚒️ <b>Выбери работу:</b>", reply_markup=work_menu(), parse_mode="HTML")
+
+@bot.message_handler(func=lambda m: m.text == "🎰 Игры")
+def cmd_games_menu(msg):
+    text = (
+        "🎰 <b>ИГРЫ</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "Выбери игру из меню ниже или введи команду:\n\n"
+        "<code>кости 1000 чет</code> — кубики\n"
+        "<code>слоты 5000</code> — автоматы\n"
+        "<code>дартс 2000</code> — дартс\n"
+        "<code>боулинг 1000</code> — боулинг\n"
+        "<code>баскетбол 1500</code> — баскетбол\n"
+        "<code>футбол 800</code> — футбол\n"
+        "<code>краш 10000 3.0</code> — краш\n"
+        "<code>рулетка 1000 красное</code> — рулетка\n"
+        "<code>мины 5000 3</code> — игра мины\n"
+        "<code>лотерея 1000</code> — лотерея"
+    )
+    bot.send_message(msg.chat.id, text, reply_markup=games_menu(), parse_mode="HTML")
 def cmd_click(msg):
     uid = msg.from_user.id
     u = get_user(uid)
@@ -617,7 +692,63 @@ def cmd_finish_ride(msg):
 # 10. ИГРЫ — КОСТИ
 # ═══════════════════════════════════════════════════════════════
 
-@bot.message_handler(func=lambda m: m.text and m.text.lower().startswith("кости"))
+@bot.message_handler(func=lambda m: m.text == "🎲 Кости")
+def btn_dice(msg):
+    bot.send_message(msg.chat.id, "🎲 <b>Кости</b>\nФормат: <code>кости СТАВКА ТИП</code>\nТипы: чет, нечет, малые, большие, или число 1-6\nПример: <code>кости 1000 чет</code>", parse_mode="HTML")
+
+@bot.message_handler(func=lambda m: m.text == "🎰 Слоты")
+def btn_slots(msg):
+    bot.send_message(msg.chat.id, "🎰 <b>Слоты</b>\nФормат: <code>слоты СТАВКА</code>\nПример: <code>слоты 5000</code>", parse_mode="HTML")
+
+@bot.message_handler(func=lambda m: m.text == "🎯 Дартс")
+def btn_darts(msg):
+    bot.send_message(msg.chat.id, "🎯 <b>Дартс</b>\nФормат: <code>дартс СТАВКА</code>\nПример: <code>дартс 2000</code>", parse_mode="HTML")
+
+@bot.message_handler(func=lambda m: m.text == "🎳 Боулинг")
+def btn_bowling(msg):
+    bot.send_message(msg.chat.id, "🎳 <b>Боулинг</b>\nФормат: <code>боулинг СТАВКА</code>\nПример: <code>боулинг 1000</code>", parse_mode="HTML")
+
+@bot.message_handler(func=lambda m: m.text == "🏀 Баскетбол")
+def btn_basketball(msg):
+    bot.send_message(msg.chat.id, "🏀 <b>Баскетбол</b>\nФормат: <code>баскетбол СТАВКА</code>\nПример: <code>баскетбол 1500</code>", parse_mode="HTML")
+
+@bot.message_handler(func=lambda m: m.text == "⚽ Футбол")
+def btn_football(msg):
+    bot.send_message(msg.chat.id, "⚽ <b>Футбол</b>\nФормат: <code>футбол СТАВКА</code>\nПример: <code>футбол 800</code>", parse_mode="HTML")
+
+@bot.message_handler(func=lambda m: m.text == "🚀 Краш")
+def btn_crash(msg):
+    bot.send_message(msg.chat.id, "🚀 <b>Краш</b>\nФормат: <code>краш СТАВКА МНОЖИТЕЛЬ</code>\nМножитель от 1.1 до 10\nПример: <code>краш 10000 3.0</code>", parse_mode="HTML")
+
+@bot.message_handler(func=lambda m: m.text == "🎡 Рулетка")
+def btn_roulette(msg):
+    bot.send_message(msg.chat.id, "🎡 <b>Рулетка</b>\nФормат: <code>рулетка СТАВКА ЦВЕТ</code>\nЦвета: красное, черное, зеленое, или число 0-36\nПример: <code>рулетка 1000 красное</code>", parse_mode="HTML")
+
+@bot.message_handler(func=lambda m: m.text == "💣 Мины")
+def btn_mines(msg):
+    bot.send_message(msg.chat.id, "💣 <b>Мины</b>\nФормат: <code>мины СТАВКА КОЛ-ВО_МИН</code>\nМин от 1 до 10\nПример: <code>мины 5000 3</code>", parse_mode="HTML")
+
+@bot.message_handler(func=lambda m: m.text == "🎟️ Лотерея")
+def btn_lottery(msg):
+    uid = msg.from_user.id
+    with db() as c:
+        c.execute("SELECT jackpot FROM lottery WHERE id=1")
+        lotto = c.fetchone()
+        c.execute("SELECT tickets FROM lottery_tickets WHERE user_id=?", (uid,))
+        my_tickets = c.fetchone()
+    jackpot = lotto["jackpot"] if lotto else 0
+    my = my_tickets["tickets"] if my_tickets else 0
+    bot.send_message(msg.chat.id,
+        f"🎟️ <b>Лотерея</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"💰 Джекпот: <b>{fmt(jackpot)} {CURRENCY}</b>\n"
+        f"🎫 Твоих билетов: <b>{my}</b>\n"
+        f"💵 Цена билета: {fmt(LOTTERY_TICKET_PRICE)}\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"Формат: <code>лотерея СУММА</code>\nПример: <code>лотерея 1000</code>",
+        parse_mode="HTML")
+
+
 def cmd_dice(msg):
     uid = msg.from_user.id
     u = get_user(uid)
@@ -978,16 +1109,16 @@ def cmd_mines(msg):
     update_balance(uid, -bet)
     show_mines_board(uid, msg.chat.id)
 
-def show_mines_board(uid: int, chat_id: int):
+def show_mines_board(uid: int, chat_id: int, message_id: int = None):
     game = mines_games.get(uid)
     if not game:
         return
-    
+
     mult = 1.0 + len(game["opened"]) * 0.2
     potential = int(game["bet"] * mult)
-    
+
     text = f"💣 <b>Мины</b> | Ставка: {fmt(game['bet'])} | Открыто: {len(game['opened'])}/25\n💰 Потенциал: {fmt(potential)}"
-    
+
     markup = InlineKeyboardMarkup()
     for i in range(0, 25, 5):
         row = []
@@ -998,12 +1129,18 @@ def show_mines_board(uid: int, chat_id: int):
             else:
                 row.append(InlineKeyboardButton("⬜", callback_data=f"mines_open_{uid}_{cell}"))
         markup.row(*row)
-    
+
     markup.row(
         InlineKeyboardButton("💰 Забрать", callback_data=f"mines_cashout_{uid}"),
         InlineKeyboardButton("🏠 Выход", callback_data=f"mines_exit_{uid}")
     )
-    
+
+    if message_id:
+        try:
+            bot.edit_message_text(text, chat_id, message_id, reply_markup=markup, parse_mode="HTML")
+            return
+        except Exception:
+            pass
     bot.send_message(chat_id, text, reply_markup=markup, parse_mode="HTML")
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("mines_open_"))
@@ -1034,7 +1171,7 @@ def cb_mines_open(call):
         return
     
     game["opened"].append(cell)
-    
+
     if len(game["opened"]) >= 20:
         mult = 1.0 + len(game["opened"]) * 0.2
         win = int(game["bet"] * mult)
@@ -1044,9 +1181,9 @@ def cb_mines_open(call):
         del mines_games[uid]
         bot.answer_callback_query(call.id, f"🎉 +{fmt(win)}")
         return
-    
+
     bot.answer_callback_query(call.id, "💎 Безопасно!")
-    show_mines_board(uid, call.message.chat.id)
+    show_mines_board(uid, call.message.chat.id, call.message.message_id)
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("mines_cashout_"))
 def cb_mines_cashout(call):
@@ -1495,10 +1632,12 @@ def cmd_stock_history(msg):
         return
     
     lines = []
-    for i, (price, ts) in enumerate(history):
+    for i, row in enumerate(history):
+        price = row["price"]
+        ts = row["ts"]
         dt = datetime.fromtimestamp(ts).strftime("%d.%m %H:%M")
         if i > 0:
-            prev = history[i-1][0]
+            prev = history[i-1]["price"]
             chg = (price - prev) / prev * 100
             icon = "🟢" if price >= prev else "🔴"
             lines.append(f"{icon} {dt}  <b>{fmt(price)}</b>  ({chg:+.1f}%)")
@@ -1510,7 +1649,11 @@ def cmd_stock_history(msg):
         trades = c.fetchall()
     
     trade_lines = []
-    for action, amt, p, ts in trades:
+    for row in trades:
+        action = row["action"]
+        amt = row["amount"]
+        p = row["price"]
+        ts = row["created_at"]
         dt = datetime.fromtimestamp(ts).strftime("%d.%m %H:%M")
         icon = "🛒" if action == "buy" else "💰"
         trade_lines.append(f"{icon} {dt}  {amt} шт. × {fmt(p)}")
