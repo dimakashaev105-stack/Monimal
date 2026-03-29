@@ -404,16 +404,17 @@ def work_inline(uid: int) -> InlineKeyboardMarkup:
 def games_inline(uid: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup(row_width=3)
     games = [
-        ("🎲 Кости",    f"game_info_dice_{uid}"),
+        ("🎲 Куб",      f"game_info_dice_{uid}"),
+        ("⚔️ Дуэль",   f"game_info_duel_{uid}"),
         ("🎰 Слоты",    f"game_info_slots_{uid}"),
         ("🎡 Рулетка",  f"game_info_roulette_{uid}"),
         ("💣 Мины",     f"game_info_mines_{uid}"),
         ("🚀 Краш",     f"game_info_crash_{uid}"),
-        ("🎟️ Лотерея",  f"game_info_lottery_{uid}"),
         ("🎯 Дартс",    f"game_info_darts_{uid}"),
         ("🎳 Боулинг",  f"game_info_bowling_{uid}"),
         ("🏀 Баскет",   f"game_info_basketball_{uid}"),
         ("⚽ Футбол",   f"game_info_football_{uid}"),
+        ("🎟️ Лотерея",  f"game_info_lottery_{uid}"),
     ]
     for name, cb in games:
         kb.add(InlineKeyboardButton(name, callback_data=cb))
@@ -867,16 +868,17 @@ def cmd_games_menu(msg):
     )
 
 GAME_HELP = {
-    "dice":       ("🎲 Кости",    "кости 1000 чет",    "Ставка + тип: чет, нечет, малые, большие, число 1-6"),
-    "slots":      ("🎰 Слоты",    "слоты 5000",         "Просто введи ставку, 3 барабана прокрутятся"),
-    "roulette":   ("🎡 Рулетка",  "рулетка 1000 красное", "Ставка + цвет: красное(×2), черное(×2), зеленое(×36), или число 0-36"),
-    "mines":      ("💣 Мины",     "мины 5000 3",         "Ставка + кол-во мин 1-10. Открывай клетки, забирай!"),
-    "crash":      ("🚀 Краш",     "краш 10000 3.0",      "Ставка + множитель 1.1-10. Успей до краша!"),
-    "lottery":    ("🎟️ Лотерея",  "лотерея 1000",        f"Купить билеты по {LOTTERY_TICKET_PRICE}. Розыгрыш раз в сутки"),
-    "darts":      ("🎯 Дартс",    "дартс 2000",          "Яблочко ×5, кольцо — возврат, промах — ×2 потеря"),
-    "bowling":    ("🎳 Боулинг",  "боулинг 1000",        "Страйк ×3, спэр ×1.5, 9 кеглей — возврат, промах — потеря"),
-    "basketball": ("🏀 Баскет",   "баскетбол 1500",      "Попадание ×2.5, трёхочковый ×3, промах — потеря"),
-    "football":   ("⚽ Футбол",   "футбол 800",          "Гол ×2, штанга — возврат, мимо — потеря"),
+    "dice":       ("🎲 Куб",      "куб чет 1000",       "Ставка + тип: чет нечет малые большие 1-6\nПример: куб чет 1000"),
+    "duel":       ("⚔️ Дуэль",   "кости 1000",          "Ответь на чьё-то сообщение и напиши кости СТАВКА — бросаете кубик, у кого больше — тот выиграл"),
+    "slots":      ("🎰 Слоты",    "слоты 1000",          "Реальный слот-машина 🎰 + свои барабаны. Джекпот x100!"),
+    "roulette":   ("🎡 Рулетка",  "рул кра 1000",        "рул + тип + ставка\nкра/ч/зел, чет/неч, мал/бол, 1д/2д/3д, 1р/2р/3р, число 0-36"),
+    "mines":      ("💣 Мины",     "мины 1000 3",         "Ставка + кол-во мин 1-24\nОткрывай 🎁, избегай 💣, забирай в любой момент!"),
+    "crash":      ("🚀 Краш",     "краш 1000 3.0",       "Ставка + множитель 1.1-10\nУспей до краша!"),
+    "darts":      ("🎯 Дартс",    "дартс 1000",          "Реальный дартс 🎯\nЯблочко x5, кольцо — возврат, промах — x2 штраф"),
+    "bowling":    ("🎳 Боулинг",  "боул 1000",           "Реальный боулинг 🎳\nСтрайк x3, спэр x1.5, 9 кеглей — возврат"),
+    "basketball": ("🏀 Баскет",   "бск 1000",            "Реальный баскетбол 🏀\nПопадание x2.5"),
+    "football":   ("⚽ Футбол",   "фтб 1000",            "Реальный футбол ⚽\nГол x2"),
+    "lottery":    ("🎟️ Лотерея",  "лотерея 1000",        f"Купить билеты по {LOTTERY_TICKET_PRICE} {CURRENCY}\nРозыгрыш раз в сутки — джекпот между всеми участниками"),
 }
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("game_info_"))
@@ -927,187 +929,452 @@ def cb_games_back(call):
 # 12. ИГРЫ — МЕХАНИКА
 # ═══════════════════════════════════════════════════════════════
 
-def game_check(msg, parts_needed=2):
-    """Проверка: зарегистрирован + нужное кол-во аргументов."""
-    if not check_reg(msg): return None
-    uid = msg.from_user.id
-    return ensure_user(uid, msg.from_user.first_name or "Игрок")
+# ── Кулдаун между играми ────────────────────────────────────────
+_game_cd = {}
+GAME_CD_SEC = 3
 
-# КОСТИ
-@bot.message_handler(func=lambda m: m.text and m.text.lower().startswith("кости"))
-def cmd_dice(msg):
+def game_check(msg) -> bool:
+    """Проверяет регистрацию и кулдаун. Возвращает True если можно играть."""
     uid = msg.from_user.id
-    u = game_check(msg)
-    if not u: return
+    if not check_reg(msg): return False
+    ensure_user(uid, msg.from_user.first_name or "Игрок")
+    t = time.time(); last = _game_cd.get(uid, 0); diff = t - last
+    if diff < GAME_CD_SEC:
+        try: bot.reply_to(msg, f"⏳ Подожди <b>{GAME_CD_SEC - diff:.1f} сек</b>", parse_mode="HTML")
+        except: pass
+        return False
+    _game_cd[uid] = t
+    return True
+
+def _parse_bet(text: str, balance: int) -> int | None:
+    """Парсит ставку: 1000, 1к, 1.5м, все."""
+    t = text.lower().strip().replace(" ", "")
+    if t in ["все", "all", "всё"]: return balance
+    import re as _re
+    m = _re.match(r'^(\d*\.?\d+)([кkм]?)$', t)
+    if m:
+        n = float(m.group(1))
+        s = m.group(2)
+        if s in ["к", "k"]: return int(n * 1_000)
+        if s == "м":        return int(n * 1_000_000)
+        return int(n)
+    try: return int(t)
+    except: return None
+
+def _get_name(msg) -> str:
+    u = get_user(msg.from_user.id)
+    return (u["name"] if u else None) or msg.from_user.first_name or "Игрок"
+
+def _win_text(name, win_amount, balance) -> str:
+    return (f"🎉 <b>{name}</b> выиграл <b>{fmt(win_amount)} {CURRENCY}</b>!\n"
+            f"<blockquote>💰 Баланс: {fmt(balance)} {CURRENCY}</blockquote>")
+
+def _lose_text(name, lose_amount, balance) -> str:
+    return (f"😢 <b>{name}</b> проиграл <b>{fmt(lose_amount)} {CURRENCY}</b>\n"
+            f"<blockquote>💰 Баланс: {fmt(balance)} {CURRENCY}</blockquote>")
+
+# ── КУБ (кости через реальный dice) ─────────────────────────────
+
+@bot.message_handler(func=lambda m: m.text and m.text.lower().startswith("куб "))
+def cmd_dice(msg):
+    if not game_check(msg): return
+    uid  = msg.from_user.id
+    u    = get_user(uid)
+    name = _get_name(msg)
     parts = msg.text.split()
-    if len(parts) < 2:
-        reply(msg, "❌ Формат: <code>кости 1000 чет</code>", parse_mode="HTML"); return
-    bet = parse_bet(parts[1], u["balance"])
-    if not bet or bet <= 0 or bet > int(u["balance"]):
-        reply(msg, f"❌ Неверная ставка. Баланс: {fmt(u['balance'])} {CURRENCY}", parse_mode="HTML"); return
-    bet_type = parts[2].lower() if len(parts) > 2 else "чет"
-    result = random.randint(1, 6)
-    icons = {1:"1️⃣",2:"2️⃣",3:"3️⃣",4:"4️⃣",5:"5️⃣",6:"6️⃣"}
+    if len(parts) < 3:
+        reply(msg, "❌ Формат: <code>куб ТИП СТАВКА</code>\nТипы: чет нечет малые большие 1-6\nПример: <code>куб чет 1000</code>", parse_mode="HTML"); return
+    bet_type = parts[1].lower()
+    bet = _parse_bet(" ".join(parts[2:]), int(u["balance"]))
+    if not bet or bet <= 0:
+        reply(msg, "❌ Неверная ставка", parse_mode="HTML"); return
+    if bet > int(u["balance"]):
+        reply(msg, f"❌ Не хватает монет. Баланс: {fmt(u['balance'])} {CURRENCY}", parse_mode="HTML"); return
+    update_balance(uid, -bet)
+    dice_msg = bot.send_dice(msg.chat.id, emoji="🎲")
+    time.sleep(1)
+    result = dice_msg.dice.value
     win, mult = False, 1
-    if   bet_type in ["чет","ч","even"]:    win = result % 2 == 0; mult = 2
-    elif bet_type in ["нечет","н","odd"]:   win = result % 2 == 1; mult = 2
-    elif bet_type in ["малые","мал"]:       win = result in [1,2,3]; mult = 2
-    elif bet_type in ["большие","бол"]:     win = result in [4,5,6]; mult = 2
+    if   bet_type in ["чет","ч","even"]:        win = result % 2 == 0; mult = 2
+    elif bet_type in ["нечет","н","odd"]:        win = result % 2 == 1; mult = 2
+    elif bet_type in ["малые","мал","small"]:    win = result in [1,2,3]; mult = 2
+    elif bet_type in ["большие","бол","big"]:    win = result in [4,5,6]; mult = 2
     elif bet_type.isdigit() and 1 <= int(bet_type) <= 6:
         win = result == int(bet_type); mult = 6
     else:
-        reply(msg, "❌ Тип: чет, нечет, малые, большие, число 1-6", parse_mode="HTML"); return
+        update_balance(uid, bet)
+        reply(msg, "❌ Тип: чет, нечет, малые, большие, 1-6", parse_mode="HTML"); return
     if win:
-        profit = bet * mult - bet
-        update_balance(uid, profit)
-        record_game(uid, "кости", bet, profit, f"{result}")
-        reply(msg, f"🎲 {icons[result]} <b>Победа!</b> +{fmt(profit)} {CURRENCY}", parse_mode="HTML")
+        win_amount = int(bet * mult)
+        update_balance(uid, win_amount)
+        record_game(uid, "куб", bet, win_amount - bet, str(result))
+        reply(msg, _win_text(name, win_amount - bet, get_user(uid)["balance"]), parse_mode="HTML")
     else:
-        update_balance(uid, -bet)
-        record_game(uid, "кости", bet, 0, f"{result}")
-        reply(msg, f"🎲 {icons[result]} Проигрыш. -{fmt(bet)} {CURRENCY}", parse_mode="HTML")
+        record_game(uid, "куб", bet, 0, str(result))
+        reply(msg, _lose_text(name, bet, get_user(uid)["balance"]), parse_mode="HTML")
 
-# СЛОТЫ
-@bot.message_handler(func=lambda m: m.text and m.text.lower().startswith("слоты"))
-def cmd_slots(msg):
-    uid = msg.from_user.id
-    u = game_check(msg)
-    if not u: return
+# ── ДУЭЛЬ КОСТЯМИ ("кости @user ставка") ────────────────────────
+
+@bot.message_handler(func=lambda m: m.text and m.text.lower().startswith("кости ") and m.reply_to_message)
+def cmd_dice_duel(msg):
+    if not game_check(msg): return
+    uid  = msg.from_user.id
+    tid  = msg.reply_to_message.from_user.id
+    if tid == uid:
+        reply(msg, "❌ Нельзя играть с собой"); return
     parts = msg.text.split()
-    if len(parts) < 2:
-        reply(msg, "❌ Формат: <code>слоты 1000</code>", parse_mode="HTML"); return
-    bet = parse_bet(parts[1], u["balance"])
-    if not bet or bet <= 0 or bet > int(u["balance"]):
-        reply(msg, f"❌ Неверная ставка. Баланс: {fmt(u['balance'])} {CURRENCY}", parse_mode="HTML"); return
-    reels = [random.choice(SLOT_SYMBOLS) for _ in range(3)]
-    combo = "".join(reels)
-    mult  = SLOT_PAYOUTS.get(combo, 0)
-    if not mult and (reels[0]==reels[1] or reels[1]==reels[2] or reels[0]==reels[2]):
-        mult = 0.5
-    if mult:
-        profit = int(bet * mult) - bet
-        update_balance(uid, profit)
-        record_game(uid, "слоты", bet, max(0, profit), combo)
-        if mult >= 1:
-            reply(msg, f"🎰 {combo}\n🎉 ×{mult}! {'+' if profit>=0 else ''}{fmt(profit)} {CURRENCY}", parse_mode="HTML")
-        else:
-            reply(msg, f"🎰 {combo}\n⚡ Возврат {fmt(int(bet*mult))} {CURRENCY}", parse_mode="HTML")
-    else:
-        update_balance(uid, -bet)
-        record_game(uid, "слоты", bet, 0, combo)
-        reply(msg, f"🎰 {combo}\n😔 Нет совпадений. -{fmt(bet)} {CURRENCY}", parse_mode="HTML")
+    bet = _parse_bet(" ".join(parts[1:]), int(get_user(uid)["balance"]))
+    if not bet or bet <= 0:
+        reply(msg, "❌ Формат: <b>ответь на сообщение</b> и напиши <code>кости 1000</code>", parse_mode="HTML"); return
+    u1 = get_user(uid); u2 = get_user(tid)
+    if not u1 or int(u1["balance"]) < bet:
+        reply(msg, f"❌ Не хватает монет. Баланс: {fmt(u1['balance'] if u1 else 0)} {CURRENCY}", parse_mode="HTML"); return
+    if not u2 or int(u2["balance"]) < bet:
+        reply(msg, "❌ У оппонента недостаточно монет", parse_mode="HTML"); return
+    n1 = _get_name(msg); n2 = msg.reply_to_message.from_user.first_name or "Игрок"
+    kb = InlineKeyboardMarkup()
+    kb.add(
+        InlineKeyboardButton("🎲 Принять", callback_data=f"duel_acc_{uid}_{tid}_{bet}"),
+        InlineKeyboardButton("❌ Отказ",   callback_data=f"duel_dec_{uid}"),
+    )
+    reply(msg, f"🎲 <b>{n1}</b> вызывает <b>{n2}</b> на кости!\n💵 Ставка: <b>{fmt(bet)} {CURRENCY}</b>",
+          markup=kb, parse_mode="HTML")
 
-# ДАРТС
-@bot.message_handler(func=lambda m: m.text and m.text.lower().startswith("дартс"))
-def cmd_darts(msg):
-    uid = msg.from_user.id
-    u = game_check(msg)
-    if not u: return
-    parts = msg.text.split()
-    if len(parts) < 2:
-        reply(msg, "❌ Формат: <code>дартс 1000</code>", parse_mode="HTML"); return
-    bet = parse_bet(parts[1], u["balance"])
-    if not bet or bet <= 0 or bet > int(u["balance"]):
-        reply(msg, f"❌ Неверная ставка. Баланс: {fmt(u['balance'])} {CURRENCY}", parse_mode="HTML"); return
-    r = random.randint(1, 6)
-    if r == 6:
-        profit = bet * 4
-        update_balance(uid, profit); record_game(uid, "дартс", bet, profit, "яблочко")
-        reply(msg, f"🎯 <b>ЯБЛОЧКО!</b> ×5! +{fmt(profit)} {CURRENCY}", parse_mode="HTML")
-    elif r in [4, 5]:
-        record_game(uid, "дартс", bet, 0, "кольцо")
-        reply(msg, "🎯 Попадание в кольцо! Ставка возвращена.", parse_mode="HTML")
+@bot.callback_query_handler(func=lambda c: c.data.startswith("duel_"))
+def cb_duel(call):
+    parts = call.data.split("_")
+    action = parts[1]
+    if action == "dec":
+        bot.edit_message_text("❌ Вызов отклонён", call.message.chat.id, call.message.message_id)
+        bot.answer_callback_query(call.id); return
+    chall_id = int(parts[2]); tgt_id = int(parts[3]); bet = int(parts[4])
+    if call.from_user.id != tgt_id:
+        bot.answer_callback_query(call.id, "❌ Не твой вызов"); return
+    u1 = get_user(chall_id); u2 = get_user(tgt_id)
+    if int(u1["balance"]) < bet or int(u2["balance"]) < bet:
+        bot.edit_message_text("❌ Недостаточно монет у одного из игроков", call.message.chat.id, call.message.message_id)
+        bot.answer_callback_query(call.id); return
+    update_balance(chall_id, -bet); update_balance(tgt_id, -bet)
+    bot.edit_message_text("🎲 Бросаем кости...", call.message.chat.id, call.message.message_id)
+    d1 = bot.send_dice(call.message.chat.id, emoji="🎲"); time.sleep(2)
+    d2 = bot.send_dice(call.message.chat.id, emoji="🎲"); time.sleep(2)
+    s1 = d1.dice.value; s2 = d2.dice.value
+    n1 = (get_user(chall_id) or {}).get("name", "Игрок 1")
+    n2 = (get_user(tgt_id)   or {}).get("name", "Игрок 2")
+    try: bot.delete_message(call.message.chat.id, d1.message_id)
+    except: pass
+    try: bot.delete_message(call.message.chat.id, d2.message_id)
+    except: pass
+    if s1 > s2:
+        update_balance(chall_id, bet * 2)
+        res = f"🏆 Победил <b>{n1}</b> ({s1} > {s2})\n💰 +{fmt(bet*2)} {CURRENCY}"
+    elif s2 > s1:
+        update_balance(tgt_id, bet * 2)
+        res = f"🏆 Победил <b>{n2}</b> ({s2} > {s1})\n💰 +{fmt(bet*2)} {CURRENCY}"
     else:
-        loss = min(bet * 2, int(u["balance"]))
-        update_balance(uid, -loss); record_game(uid, "дартс", bet, 0, "промах")
-        reply(msg, f"💥 ПРОМАХ! -{fmt(loss)} {CURRENCY}", parse_mode="HTML")
+        update_balance(chall_id, bet); update_balance(tgt_id, bet)
+        res = f"🤝 Ничья ({s1} = {s2}) — ставки возвращены"
+    bot.send_message(call.message.chat.id,
+        f"⚔️ <b>Результат дуэли</b>\n{n1}: <b>{s1}</b> | {n2}: <b>{s2}</b>\n{res}", parse_mode="HTML")
+    bot.answer_callback_query(call.id)
 
-# БОУЛИНГ
-@bot.message_handler(func=lambda m: m.text and m.text.lower().startswith("боулинг"))
-def cmd_bowling(msg):
-    uid = msg.from_user.id
-    u = game_check(msg)
-    if not u: return
-    parts = msg.text.split()
-    if len(parts) < 2:
-        reply(msg, "❌ Формат: <code>боулинг 1000</code>", parse_mode="HTML"); return
-    bet = parse_bet(parts[1], u["balance"])
-    if not bet or bet <= 0 or bet > int(u["balance"]):
-        reply(msg, f"❌ Неверная ставка. Баланс: {fmt(u['balance'])} {CURRENCY}", parse_mode="HTML"); return
-    r = random.randint(1, 6)
-    if r == 6:
-        profit = bet * 2
-        update_balance(uid, profit); record_game(uid, "боулинг", bet, profit, "страйк")
-        reply(msg, f"🎳 <b>СТРАЙК!</b> ×3! +{fmt(profit)} {CURRENCY}", parse_mode="HTML")
-    elif r == 5:
-        profit = int(bet * 0.5)
-        update_balance(uid, profit); record_game(uid, "боулинг", bet, profit, "спэр")
-        reply(msg, f"🎳 Спэр! ×1.5! +{fmt(profit)} {CURRENCY}", parse_mode="HTML")
-    elif r >= 3:
-        record_game(uid, "боулинг", bet, 0, "9 кеглей")
-        reply(msg, "🎳 9 кеглей! Ставка возвращена.", parse_mode="HTML")
-    else:
-        update_balance(uid, -bet); record_game(uid, "боулинг", bet, 0, "промах")
-        reply(msg, f"🎳 Промах! -{fmt(bet)} {CURRENCY}", parse_mode="HTML")
+# ── БАСКЕТБОЛ ────────────────────────────────────────────────────
 
-# БАСКЕТБОЛ
-@bot.message_handler(func=lambda m: m.text and m.text.lower().startswith("баскетбол"))
+@bot.message_handler(func=lambda m: m.text and m.text.lower().startswith(("бск ", "баскетбол ")))
 def cmd_basketball(msg):
-    uid = msg.from_user.id
-    u = game_check(msg)
-    if not u: return
+    if not game_check(msg): return
+    uid  = msg.from_user.id; u = get_user(uid); name = _get_name(msg)
     parts = msg.text.split()
-    if len(parts) < 2:
-        reply(msg, "❌ Формат: <code>баскетбол 1000</code>", parse_mode="HTML"); return
-    bet = parse_bet(parts[1], u["balance"])
+    bet = _parse_bet(" ".join(parts[1:]), int(u["balance"]))
     if not bet or bet <= 0 or bet > int(u["balance"]):
-        reply(msg, f"❌ Неверная ставка. Баланс: {fmt(u['balance'])} {CURRENCY}", parse_mode="HTML"); return
-    r = random.randint(1, 6)
-    if r == 6:
-        profit = bet * 2
-        update_balance(uid, profit); record_game(uid, "баскетбол", bet, profit, "трёхочковый")
-        reply(msg, f"🏀 <b>ТРЁХОЧКОВЫЙ!</b> ×3! +{fmt(profit)} {CURRENCY}", parse_mode="HTML")
-    elif r in [4, 5]:
-        profit = int(bet * 1.5)
-        update_balance(uid, profit); record_game(uid, "баскетбол", bet, profit, "попадание")
-        reply(msg, f"🏀 <b>ПОПАДАНИЕ!</b> ×2.5! +{fmt(profit)} {CURRENCY}", parse_mode="HTML")
+        reply(msg, "❌ Формат: <code>бск СТАВКА</code>\nПример: <code>бск 1000</code>", parse_mode="HTML"); return
+    update_balance(uid, -bet)
+    dice_msg = bot.send_dice(msg.chat.id, emoji="🏀"); time.sleep(1)
+    result = dice_msg.dice.value
+    if result in [4, 5]:
+        win = int(bet * 2.5)
+        update_balance(uid, win)
+        record_game(uid, "баскетбол", bet, win - bet, str(result))
+        reply(msg, _win_text(name, win - bet, get_user(uid)["balance"]), parse_mode="HTML")
     else:
-        update_balance(uid, -bet); record_game(uid, "баскетбол", bet, 0, "промах")
-        reply(msg, f"🏀 Промах! -{fmt(bet)} {CURRENCY}", parse_mode="HTML")
+        record_game(uid, "баскетбол", bet, 0, str(result))
+        reply(msg, _lose_text(name, bet, get_user(uid)["balance"]), parse_mode="HTML")
 
-# ФУТБОЛ
-@bot.message_handler(func=lambda m: m.text and m.text.lower().startswith("футбол"))
+# ── ФУТБОЛ ───────────────────────────────────────────────────────
+
+@bot.message_handler(func=lambda m: m.text and m.text.lower().startswith(("фтб ", "футбол ")))
 def cmd_football(msg):
-    uid = msg.from_user.id
-    u = game_check(msg)
-    if not u: return
+    if not game_check(msg): return
+    uid  = msg.from_user.id; u = get_user(uid); name = _get_name(msg)
     parts = msg.text.split()
-    if len(parts) < 2:
-        reply(msg, "❌ Формат: <code>футбол 1000</code>", parse_mode="HTML"); return
-    bet = parse_bet(parts[1], u["balance"])
+    bet = _parse_bet(" ".join(parts[1:]), int(u["balance"]))
     if not bet or bet <= 0 or bet > int(u["balance"]):
-        reply(msg, f"❌ Неверная ставка. Баланс: {fmt(u['balance'])} {CURRENCY}", parse_mode="HTML"); return
-    r = random.randint(1, 6)
-    if r in [3, 4]:
-        update_balance(uid, bet); record_game(uid, "футбол", bet, bet, "гол")
-        reply(msg, f"⚽ <b>ГОЛ!</b> ×2! +{fmt(bet)} {CURRENCY}", parse_mode="HTML")
-    elif r == 5:
-        record_game(uid, "футбол", bet, 0, "штанга")
-        reply(msg, "⚽ В ШТАНГУ! Ставка возвращена.", parse_mode="HTML")
+        reply(msg, "❌ Формат: <code>фтб СТАВКА</code>\nПример: <code>фтб 1000</code>", parse_mode="HTML"); return
+    update_balance(uid, -bet)
+    dice_msg = bot.send_dice(msg.chat.id, emoji="⚽"); time.sleep(1)
+    result = dice_msg.dice.value
+    if result in [3, 4]:
+        win = bet * 2
+        update_balance(uid, win)
+        record_game(uid, "футбол", bet, win - bet, str(result))
+        reply(msg, _win_text(name, win - bet, get_user(uid)["balance"]), parse_mode="HTML")
     else:
-        update_balance(uid, -bet); record_game(uid, "футбол", bet, 0, "мимо")
-        reply(msg, f"⚽ Мимо! -{fmt(bet)} {CURRENCY}", parse_mode="HTML")
+        record_game(uid, "футбол", bet, 0, str(result))
+        reply(msg, _lose_text(name, bet, get_user(uid)["balance"]), parse_mode="HTML")
 
-# КРАШ
-@bot.message_handler(func=lambda m: m.text and m.text.lower().startswith("краш"))
-def cmd_crash(msg):
-    uid = msg.from_user.id
-    u = game_check(msg)
-    if not u: return
+# ── ДАРТС ────────────────────────────────────────────────────────
+
+@bot.message_handler(func=lambda m: m.text and m.text.lower().startswith("дартс "))
+def cmd_darts(msg):
+    if not game_check(msg): return
+    uid  = msg.from_user.id; u = get_user(uid); name = _get_name(msg)
+    parts = msg.text.split()
+    bet = _parse_bet(" ".join(parts[1:]), int(u["balance"]))
+    if not bet or bet <= 0:
+        reply(msg, "❌ Формат: <code>дартс СТАВКА</code>\nПример: <code>дартс 1000</code>", parse_mode="HTML"); return
+    # При промахе списывается x2, нужно иметь минимум x2 ставки
+    if bet * 2 > int(u["balance"]):
+        reply(msg, f"❌ Нужно минимум {fmt(bet*2)} {CURRENCY} (промах = x2 штраф)\nТвой баланс: {fmt(u['balance'])} {CURRENCY}", parse_mode="HTML"); return
+    update_balance(uid, -bet)
+    dice_msg = bot.send_dice(msg.chat.id, emoji="🎯"); time.sleep(1)
+    result = dice_msg.dice.value
+    if result == 6:
+        # Яблочко x5
+        win = bet * 5
+        update_balance(uid, win)
+        record_game(uid, "дартс", bet, win - bet, "яблочко")
+        reply(msg, f"🎯 <b>ЯБЛОЧКО!</b> x5\n👤 {name}\n💵 Выигрыш: <b>+{fmt(win-bet)} {CURRENCY}</b>\n<blockquote>💰 {fmt(get_user(uid)['balance'])} {CURRENCY}</blockquote>", parse_mode="HTML")
+    elif result in [4, 5]:
+        # Кольцо — возврат
+        update_balance(uid, bet)
+        record_game(uid, "дартс", bet, 0, "кольцо")
+        reply(msg, f"🎯 Попадание в кольцо\n👤 {name}\nСтавка возвращена: {fmt(bet)} {CURRENCY}\n<blockquote>💰 {fmt(get_user(uid)['balance'])} {CURRENCY}</blockquote>", parse_mode="HTML")
+    else:
+        # Промах — x2 штраф
+        update_balance(uid, -bet)
+        record_game(uid, "дартс", bet, 0, "промах")
+        reply(msg, f"💥 ПРОМАХ!\n👤 {name}\nПотеряно: <b>-{fmt(bet*2)} {CURRENCY}</b> (x2 штраф)\n<blockquote>💰 {fmt(get_user(uid)['balance'])} {CURRENCY}</blockquote>", parse_mode="HTML")
+
+# ── БОУЛИНГ ──────────────────────────────────────────────────────
+
+@bot.message_handler(func=lambda m: m.text and m.text.lower().startswith(("боул ", "боулинг ")))
+def cmd_bowling(msg):
+    if not game_check(msg): return
+    uid  = msg.from_user.id; u = get_user(uid); name = _get_name(msg)
+    parts = msg.text.split()
+    bet = _parse_bet(" ".join(parts[1:]), int(u["balance"]))
+    if not bet or bet <= 0 or bet > int(u["balance"]):
+        reply(msg, "❌ Формат: <code>боул СТАВКА</code>\nПример: <code>боул 1000</code>", parse_mode="HTML"); return
+    update_balance(uid, -bet)
+    dice_msg = bot.send_dice(msg.chat.id, emoji="🎳"); time.sleep(1)
+    result = dice_msg.dice.value
+    if result == 6:
+        win = bet * 3
+        update_balance(uid, win)
+        record_game(uid, "боулинг", bet, win - bet, "страйк")
+        reply(msg, f"🎳 <b>СТРАЙК!</b> x3\n{_win_text(name, win-bet, get_user(uid)['balance'])}", parse_mode="HTML")
+    elif result == 5:
+        win = int(bet * 1.5)
+        update_balance(uid, win)
+        record_game(uid, "боулинг", bet, win - bet, "спэр")
+        reply(msg, f"🎳 Спэр! x1.5\n{_win_text(name, win-bet, get_user(uid)['balance'])}", parse_mode="HTML")
+    elif result == 4:
+        # Возврат ставки
+        update_balance(uid, bet)
+        record_game(uid, "боулинг", bet, 0, "9 кеглей")
+        reply(msg, f"🎳 9 кеглей! Ставка возвращена\n<blockquote>💰 {fmt(get_user(uid)['balance'])} {CURRENCY}</blockquote>", parse_mode="HTML")
+    else:
+        record_game(uid, "боулинг", bet, 0, "промах")
+        reply(msg, _lose_text(name, bet, get_user(uid)["balance"]), parse_mode="HTML")
+
+# ── СЛОТЫ (реальный dice 🎰) ─────────────────────────────────────
+# Значения dice 🎰: 1=BAR, 22=виноград, 43=лимон, 64=семёрки
+SLOT_CONFIG = {
+    "symbols": [
+        {"emoji": "🍒", "name": "Вишня",       "multiplier": 1.2, "weight": 35},
+        {"emoji": "🍋", "name": "Лимон",        "multiplier": 1.5, "weight": 25},
+        {"emoji": "🍊", "name": "Апельсин",     "multiplier": 2,   "weight": 20},
+        {"emoji": "🍇", "name": "Виноград",     "multiplier": 2.3, "weight": 12},
+        {"emoji": "🔔", "name": "Колокольчик",  "multiplier": 4,   "weight": 4},
+        {"emoji": "🎁", "name": "Бриллиант",    "multiplier": 10,  "weight": 2},
+        {"emoji": "⭐", "name": "Звезда",       "multiplier": 7,   "weight": 3},
+        {"emoji": "🍀", "name": "Клевер",       "multiplier": 3,   "weight": 8},
+        {"emoji": "⚔️", "name": "Джекпот",     "multiplier": 25,  "weight": 1},
+    ],
+    "special": {
+        1:  {"name": "ДЖЕКПОТ ⚔️⚔️⚔️",         "mult": 100},
+        22: {"name": "ТРИ ВИНОГРАДИНЫ 🍇🍇🍇", "mult": 30},
+        43: {"name": "ТРИ ЛИМОНА 🍋🍋🍋",      "mult": 15},
+        64: {"name": "СЕМЁРКИ 7️⃣7️⃣7️⃣",        "mult": 50},
+    }
+}
+
+def _spin_slots():
+    total = sum(s["weight"] for s in SLOT_CONFIG["symbols"])
+    def pick():
+        r = random.uniform(0, total); cur = 0
+        for s in SLOT_CONFIG["symbols"]:
+            cur += s["weight"]
+            if r <= cur: return s
+        return SLOT_CONFIG["symbols"][0]
+    reels = [pick(), pick(), pick()]
+    # Проверяем три одинаковых
+    if reels[0]["emoji"] == reels[1]["emoji"] == reels[2]["emoji"]:
+        combo = {"name": f"ТРИ {reels[0]['name'].upper()}!", "mult": reels[0]["multiplier"] * 2}
+    elif reels[0]["emoji"] == reels[1]["emoji"] or reels[1]["emoji"] == reels[2]["emoji"] or reels[0]["emoji"] == reels[2]["emoji"]:
+        for s in SLOT_CONFIG["symbols"]:
+            if [reels[0]["emoji"], reels[1]["emoji"], reels[2]["emoji"]].count(s["emoji"]) == 2:
+                combo = {"name": f"ДВЕ {s['name'].upper()}", "mult": s["multiplier"]}; break
+        else: combo = None
+    else: combo = None
+    return reels, combo
+
+@bot.message_handler(func=lambda m: m.text and m.text.lower().startswith(("слоты ", "слот ")))
+def cmd_slots(msg):
+    if not game_check(msg): return
+    uid  = msg.from_user.id; u = get_user(uid); name = _get_name(msg)
+    parts = msg.text.split()
+    bet = _parse_bet(" ".join(parts[1:]), int(u["balance"]))
+    if not bet or bet < 100:
+        reply(msg, "❌ Формат: <code>слоты СТАВКА</code>\nМин. ставка: 100\nПример: <code>слоты 1000</code>", parse_mode="HTML"); return
+    if bet > int(u["balance"]):
+        reply(msg, f"❌ Не хватает монет. Баланс: {fmt(u['balance'])} {CURRENCY}", parse_mode="HTML"); return
+    update_balance(uid, -bet)
+    # Отправляем реальный dice 🎰
+    dice_msg = bot.send_dice(msg.chat.id, emoji="🎰"); time.sleep(1.5)
+    dval = dice_msg.dice.value
+    spec = SLOT_CONFIG["special"].get(dval)
+    if spec:
+        win = int(bet * spec["mult"])
+        update_balance(uid, win)
+        record_game(uid, "слоты", bet, win - bet, spec["name"])
+        reply(msg, f"🎰 <b>{spec['name']}!</b>\n📈 x{spec['mult']}\n{_win_text(name, win-bet, get_user(uid)['balance'])}", parse_mode="HTML")
+        return
+    # Иначе — наши барабаны
+    reels, combo = _spin_slots()
+    display = f"🎰─────🎰─────🎰\n│  {reels[0]['emoji']}  │  {reels[1]['emoji']}  │  {reels[2]['emoji']}  │\n🎰─────🎰─────🎰"
+    if combo:
+        win = int(bet * combo["mult"])
+        update_balance(uid, win)
+        record_game(uid, "слоты", bet, win - bet, combo["name"])
+        new_bal = get_user(uid)["balance"]
+        kb = InlineKeyboardMarkup()
+        kb.add(InlineKeyboardButton("🎰 Ещё раз", callback_data=f"slots_again_{uid}_{bet}"))
+        reply(msg, f"{display}\n🎊 <b>{combo['name']}!</b> x{combo['mult']}\n{_win_text(name, win-bet, new_bal)}",
+              markup=kb, parse_mode="HTML")
+    else:
+        record_game(uid, "слоты", bet, 0, "нет комбо")
+        new_bal = get_user(uid)["balance"]
+        kb = InlineKeyboardMarkup()
+        kb.add(InlineKeyboardButton("🎰 Ещё раз", callback_data=f"slots_again_{uid}_{bet}"))
+        reply(msg, f"{display}\n😔 Нет совпадений. -{fmt(bet)} {CURRENCY}\n<blockquote>💰 {fmt(new_bal)} {CURRENCY}</blockquote>",
+              markup=kb, parse_mode="HTML")
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("slots_again_"))
+def cb_slots_again(call):
+    uid = call.from_user.id
+    parts = call.data.split("_")
+    tuid = int(parts[2]); bet = int(parts[3])
+    if uid != tuid:
+        bot.answer_callback_query(call.id, "❌ Не твоя кнопка"); return
+    u = get_user(uid)
+    if int(u["balance"]) < bet:
+        bot.answer_callback_query(call.id, f"❌ Не хватает монет ({fmt(bet)})", show_alert=True); return
+    bot.answer_callback_query(call.id)
+    update_balance(uid, -bet)
+    reels, combo = _spin_slots()
+    name = _get_name(call)
+    display = f"🎰─────🎰─────🎰\n│  {reels[0]['emoji']}  │  {reels[1]['emoji']}  │  {reels[2]['emoji']}  │\n🎰─────🎰─────🎰"
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("🎰 Ещё раз", callback_data=f"slots_again_{uid}_{bet}"))
+    if combo:
+        win = int(bet * combo["mult"])
+        update_balance(uid, win)
+        record_game(uid, "слоты", bet, win - bet, combo["name"])
+        new_bal = get_user(uid)["balance"]
+        try:
+            bot.edit_message_text(f"{display}\n🎊 <b>{combo['name']}!</b> x{combo['mult']}\n{_win_text(name, win-bet, new_bal)}",
+                call.message.chat.id, call.message.message_id, reply_markup=kb, parse_mode="HTML")
+        except: pass
+    else:
+        record_game(uid, "слоты", bet, 0, "нет комбо")
+        new_bal = get_user(uid)["balance"]
+        try:
+            bot.edit_message_text(f"{display}\n😔 Нет совпадений. -{fmt(bet)} {CURRENCY}\n<blockquote>💰 {fmt(new_bal)} {CURRENCY}</blockquote>",
+                call.message.chat.id, call.message.message_id, reply_markup=kb, parse_mode="HTML")
+        except: pass
+
+# ── РУЛЕТКА (рул) ────────────────────────────────────────────────
+RED_NUMBERS = [1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36]
+ROW1 = [1,4,7,10,13,16,19,22,25,28,31,34]
+ROW2 = [2,5,8,11,14,17,20,23,26,29,32,35]
+ROW3 = [3,6,9,12,15,18,21,24,27,30,33,36]
+
+@bot.message_handler(func=lambda m: m.text and m.text.lower().startswith("рул "))
+def cmd_roulette(msg):
+    if not game_check(msg): return
+    uid  = msg.from_user.id; u = get_user(uid); name = _get_name(msg)
     parts = msg.text.split()
     if len(parts) < 3:
-        reply(msg, "❌ Формат: <code>краш 1000 2.5</code>", parse_mode="HTML"); return
-    bet = parse_bet(parts[1], u["balance"])
+        reply(msg,
+            "🎡 <b>Рулетка 0-36</b>\nФормат: <code>рул ТИП СТАВКА</code>\n\n"
+            "Типы:\n"
+            "🔴 <code>кра/к</code> — красное (x2)\n"
+            "⚫ <code>чер/ч</code> — чёрное (x2)\n"
+            "🟢 <code>зел/з</code> — зеро (x36)\n"
+            "📋 <code>чет/неч</code> — чётное/нечётное (x2)\n"
+            "📋 <code>мал/бол</code> — 1-18/19-36 (x2)\n"
+            "📦 <code>1д/2д/3д</code> — дюжины (x3)\n"
+            "📋 <code>1р/2р/3р</code> — ряды (x3)\n"
+            "🔢 <code>0-36</code> — число (x36)\n\n"
+            "Пример: <code>рул кра 1000</code>",
+            parse_mode="HTML"); return
+    bet_type = parts[1].lower()
+    bet = _parse_bet(" ".join(parts[2:]), int(u["balance"]))
+    if not bet or bet <= 0 or bet > int(u["balance"]):
+        reply(msg, f"❌ Неверная ставка. Баланс: {fmt(u['balance'])} {CURRENCY}", parse_mode="HTML"); return
+    update_balance(uid, -bet)
+    number = random.randint(0, 36)
+    if number == 0:           color = "🟢"
+    elif number in RED_NUMBERS: color = "🔴"
+    else:                      color = "⚫"
+    win, mult = False, 1
+    if   bet_type in ["красное","крас","кра","к","red"]:   win = number in RED_NUMBERS; mult = 2
+    elif bet_type in ["черное","чёрное","чер","ч","black"]: win = number != 0 and number not in RED_NUMBERS; mult = 2
+    elif bet_type in ["зеленое","зелен","зел","з","green"]: win = number == 0; mult = 36
+    elif bet_type in ["четное","чет","чёт","even"]:         win = number != 0 and number % 2 == 0; mult = 2
+    elif bet_type in ["нечетное","нечет","неч","odd"]:      win = number != 0 and number % 2 == 1; mult = 2
+    elif bet_type in ["малые","мал","small"]:               win = 1 <= number <= 18; mult = 2
+    elif bet_type in ["большие","бол","big"]:               win = 19 <= number <= 36; mult = 2
+    elif bet_type in ["1д","1-12","1дюж"]:                  win = 1 <= number <= 12; mult = 3
+    elif bet_type in ["2д","13-24","2дюж"]:                 win = 13 <= number <= 24; mult = 3
+    elif bet_type in ["3д","25-36","3дюж"]:                 win = 25 <= number <= 36; mult = 3
+    elif bet_type in ["1р","ряд1","1ряд"]:                  win = number in ROW1; mult = 3
+    elif bet_type in ["2р","ряд2","2ряд"]:                  win = number in ROW2; mult = 3
+    elif bet_type in ["3р","ряд3","3ряд"]:                  win = number in ROW3; mult = 3
+    elif bet_type.isdigit() and 0 <= int(bet_type) <= 36:  win = number == int(bet_type); mult = 36
+    else:
+        update_balance(uid, bet)
+        reply(msg, "❌ Неизвестный тип ставки!\nНапиши <code>рул</code> без аргументов для справки.", parse_mode="HTML"); return
+    if win:
+        win_amount = int(bet * mult)
+        update_balance(uid, win_amount)
+        record_game(uid, "рулетка", bet, win_amount - bet, str(number))
+        reply(msg, f"🎡 Выпало {color}<b>{number}</b>\n{_win_text(name, win_amount-bet, get_user(uid)['balance'])}", parse_mode="HTML")
+    else:
+        record_game(uid, "рулетка", bet, 0, str(number))
+        reply(msg, f"🎡 Выпало {color}<b>{number}</b>\n{_lose_text(name, bet, get_user(uid)['balance'])}", parse_mode="HTML")
+
+# ── КРАШ ─────────────────────────────────────────────────────────
+
+@bot.message_handler(func=lambda m: m.text and m.text.lower().startswith("краш "))
+def cmd_crash(msg):
+    if not game_check(msg): return
+    uid  = msg.from_user.id; u = get_user(uid); name = _get_name(msg)
+    parts = msg.text.split()
+    if len(parts) < 3:
+        reply(msg, "❌ Формат: <code>краш СТАВКА МНОЖИТЕЛЬ</code>\nМножитель: 1.1 - 10\nПример: <code>краш 1000 3.0</code>", parse_mode="HTML"); return
+    bet = _parse_bet(parts[1], int(u["balance"]))
     if not bet or bet <= 0 or bet > int(u["balance"]):
         reply(msg, f"❌ Неверная ставка. Баланс: {fmt(u['balance'])} {CURRENCY}", parse_mode="HTML"); return
     try:
@@ -1118,232 +1385,220 @@ def cmd_crash(msg):
     update_balance(uid, -bet)
     crash_at = max(1.01, min(20, round(random.expovariate(0.8) + 1.0, 2)))
     if crash_at >= target:
-        win    = int(bet * target)
+        win = int(bet * target)
         update_balance(uid, win)
-        profit = win - bet
-        record_game(uid, "краш", bet, profit, f"{crash_at:.2f}x")
-        reply(msg, f"🚀 <b>Краш на {crash_at:.2f}x!</b>\n✅ Твой ×{target} выжил!\n💰 +{fmt(profit)} {CURRENCY}", parse_mode="HTML")
+        record_game(uid, "краш", bet, win - bet, f"краш на {crash_at:.2f}x")
+        reply(msg, f"🚀 Краш на <b>{crash_at:.2f}x</b>!\n✅ Твой x{target} выжил!\n{_win_text(name, win-bet, get_user(uid)['balance'])}", parse_mode="HTML")
     else:
-        record_game(uid, "краш", bet, 0, f"{crash_at:.2f}x")
-        reply(msg, f"💥 <b>Краш на {crash_at:.2f}x!</b>\n❌ Твой ×{target} не успел!\n📉 -{fmt(bet)} {CURRENCY}", parse_mode="HTML")
+        record_game(uid, "краш", bet, 0, f"краш на {crash_at:.2f}x")
+        reply(msg, f"💥 Краш на <b>{crash_at:.2f}x</b>!\n❌ Твой x{target} не успел\n{_lose_text(name, bet, get_user(uid)['balance'])}", parse_mode="HTML")
 
-# РУЛЕТКА
-@bot.message_handler(func=lambda m: m.text and m.text.lower().startswith("рулетка"))
-def cmd_roulette(msg):
-    uid = msg.from_user.id
-    u = game_check(msg)
-    if not u: return
-    parts = msg.text.split()
-    if len(parts) < 3:
-        reply(msg, "❌ Формат: <code>рулетка 1000 красное</code>", parse_mode="HTML"); return
-    bet = parse_bet(parts[1], u["balance"])
-    if not bet or bet <= 0 or bet > int(u["balance"]):
-        reply(msg, f"❌ Неверная ставка. Баланс: {fmt(u['balance'])} {CURRENCY}", parse_mode="HTML"); return
-    bt = parts[2].lower()
-    result = random.randint(0, 36)
-    win, mult = False, 1
-    if   bt in ["красное","крас","к","red"]:  win = result in RED_NUMBERS; mult = 2
-    elif bt in ["черное","чёрное","черн","black"]: win = result!=0 and result not in RED_NUMBERS; mult = 2
-    elif bt in ["зеленое","зёленое","зел","green"]: win = result==0; mult = 36
-    elif bt in ["чет","even"]: win = result!=0 and result%2==0; mult = 2
-    elif bt in ["нечет","odd"]: win = result%2==1; mult = 2
-    elif bt.isdigit() and 0 <= int(bt) <= 36: win = result==int(bt); mult = 36
-    else:
-        reply(msg, "❌ Ставка: красное, черное, зеленое, чет, нечет, 0-36", parse_mode="HTML"); return
-    color = "🔴" if result in RED_NUMBERS else "⚫" if result != 0 else "🟢"
-    if win:
-        profit = bet * mult - bet
-        update_balance(uid, profit); record_game(uid, "рулетка", bet, profit, f"{result}")
-        reply(msg, f"🎡 <b>{color} {result}</b>\n🎉 Победа! +{fmt(profit)} {CURRENCY}", parse_mode="HTML")
-    else:
-        update_balance(uid, -bet); record_game(uid, "рулетка", bet, 0, f"{result}")
-        reply(msg, f"🎡 <b>{color} {result}</b>\n😔 Проигрыш. -{fmt(bet)} {CURRENCY}", parse_mode="HTML")
+# ── МИНЫ ─────────────────────────────────────────────────────────
+# Таблица множителей из реального казино
+_MINES_MULT = {
+    1:  {1:1.01,2:1.02,3:1.04,4:1.06,5:1.09,6:1.12,7:1.16,8:1.21,9:1.27,10:1.33,
+         11:1.41,12:1.50,13:1.60,14:1.72,15:1.86,16:2.02,17:2.21,18:2.44,19:2.72,20:3.05},
+    2:  {1:1.02,2:1.04,3:1.08,4:1.12,5:1.18,6:1.25,7:1.33,8:1.42,9:1.53,10:1.66,
+         11:1.81,12:2.00,13:2.22,14:2.48,15:2.78,16:3.14,17:3.57,18:4.09,19:4.72,20:5.48},
+    3:  {1:1.03,2:1.07,3:1.12,4:1.19,5:1.27,6:1.37,7:1.49,8:1.63,9:1.80,10:2.00,
+         11:2.24,12:2.52,13:2.86,14:3.27,15:3.76,16:4.35,17:5.06,18:5.92,19:6.97,20:8.26},
+    5:  {1:1.05,2:1.13,3:1.23,4:1.34,5:1.48,6:1.65,7:1.85,8:2.09,9:2.37,10:2.71,
+         11:3.12,12:3.62,13:4.23,14:4.98,15:5.89,16:7.01,17:8.40,18:10.13,19:12.28,20:14.96},
+    7:  {1:1.07,2:1.19,3:1.34,4:1.52,5:1.73,6:1.98,7:2.28,8:2.64,9:3.08,10:3.61,
+         11:4.25,12:5.03,13:6.00,14:7.21,15:8.71,16:10.58,17:12.92,18:15.87,19:19.56,20:24.21},
+    10: {1:1.10,2:1.31,3:1.56,4:1.86,5:2.22,6:2.65,7:3.18,8:3.83,9:4.64,10:5.66,
+         11:6.94,12:8.55,13:10.60,14:13.22,15:16.60,16:20.98,17:26.69,18:34.18,19:44.05,20:57.08},
+    15: {1:1.15,2:1.57,3:2.12,4:2.85,5:3.85,6:5.24,7:7.20,8:9.98,9:13.96,10:19.74,
+         11:28.18,12:40.61,13:59.04,14:86.62,15:128.28,16:191.68,17:289.11,18:440.65,19:677.92,20:1053.11},
+    24: {1:1.25,2:2.43,3:4.69,4:9.18,5:18.29,6:37.04,7:76.19,8:159.25,9:337.92,10:727.20},
+}
 
-# МИНЫ
-mines_games = {}
-
-@bot.message_handler(func=lambda m: m.text and m.text.lower().startswith("мины"))
-def cmd_mines(msg):
-    uid = msg.from_user.id
-    u = game_check(msg)
-    if not u: return
-    parts = msg.text.split()
-    if len(parts) < 3:
-        reply(msg, "❌ Формат: <code>мины 1000 3</code>", parse_mode="HTML"); return
-    if uid in mines_games:
-        reply(msg, "⚠️ У тебя уже есть активная игра! Завершите её.", parse_mode="HTML"); return
-    bet = parse_bet(parts[1], u["balance"])
-    if not bet or bet <= 0 or bet > int(u["balance"]):
-        reply(msg, f"❌ Неверная ставка. Баланс: {fmt(u['balance'])} {CURRENCY}", parse_mode="HTML"); return
-    try:
-        mc = int(parts[2])
-        if mc < 1 or mc > 10: raise ValueError
-    except:
-        reply(msg, "❌ Мин от 1 до 10", parse_mode="HTML"); return
-    mines_games[uid] = {
-        "bet": bet, "mines": random.sample(range(25), mc),
-        "opened": [], "mines_count": mc, "chat_id": msg.chat.id
-    }
-    update_balance(uid, -bet)
-    show_mines_board(uid, msg.chat.id)
-
-def mines_mult(opened: int, mc: int) -> float:
+def _mines_mult(mines_count: int, opened: int) -> float:
     if opened == 0: return 1.0
-    m = 1.0
-    for i in range(opened):
-        m *= (25 - mc - i) / (25 - i)
-    return max(1.01, round(1.0 / m * 0.97, 2))
+    # Находим ближайшую таблицу
+    keys = sorted(_MINES_MULT.keys())
+    mc = min(keys, key=lambda k: abs(k - mines_count))
+    tbl = _MINES_MULT[mc]
+    return tbl.get(opened, tbl.get(max(tbl.keys()), 1.0))
 
-def show_mines_board(uid: int, chat_id: int, message_id: int = None):
-    game = mines_games.get(uid)
+active_mines_games = {}
+
+def _generate_board(mines_count: int) -> list:
+    board = [False] * 25
+    for i in random.sample(range(25), mines_count):
+        board[i] = True
+    return board
+
+def _show_mines(chat_id: int, uid: int, message_id: int = None):
+    game = active_mines_games.get(uid)
     if not game: return
-    mult  = mines_mult(len(game["opened"]), game["mines_count"])
-    pot   = int(game["bet"] * mult)
-    text  = (
-        f"💣 <b>Мины</b> | Ставка: {fmt(game['bet'])} | Мин: {game['mines_count']}\n"
-        f"✅ Открыто: {len(game['opened'])}/25 | 💰 Потенциал: {fmt(pot)} (×{mult})"
-    )
+    mc   = game["mines_count"]; opened = len(game["revealed_safe"])
+    mult = _mines_mult(mc, opened)
+    pot  = int(game["bet"] * mult)
+    text = (f"💣 <b>Мины</b> | Ставка: {fmt(game['bet'])} {CURRENCY} | Мин: {mc}\n"
+            f"✅ Открыто: {opened} | 💰 Потенциал: {fmt(pot)} (x{mult:.2f})")
     kb = InlineKeyboardMarkup()
     for i in range(0, 25, 5):
         row = []
         for j in range(5):
-            cell = i + j
-            if cell in game["opened"]:
-                row.append(InlineKeyboardButton("💎", callback_data=f"mno_{cell}"))
+            idx = i + j
+            if idx in game["revealed_safe"]:
+                row.append(InlineKeyboardButton("🎁", callback_data=f"mg_already_{idx}"))
+            elif idx in game["revealed_mines"]:
+                row.append(InlineKeyboardButton("💣", callback_data=f"mg_already_{idx}"))
             else:
-                row.append(InlineKeyboardButton("⬜", callback_data=f"mop_{uid}_{cell}"))
+                row.append(InlineKeyboardButton("❇️", callback_data=f"mg_open_{uid}_{idx}"))
         kb.row(*row)
     kb.row(
-        InlineKeyboardButton(f"💰 Забрать {fmt(pot)}", callback_data=f"mco_{uid}"),
-        InlineKeyboardButton("🏃 Выход",              callback_data=f"mex_{uid}")
+        InlineKeyboardButton(f"💵 Забрать {fmt(pot)}", callback_data=f"mg_cash_{uid}"),
+        InlineKeyboardButton("❌ Выход",               callback_data=f"mg_exit_{uid}"),
     )
     if message_id:
         try:
             bot.edit_message_text(text, chat_id, message_id, reply_markup=kb, parse_mode="HTML"); return
         except: pass
-    bot.send_message(chat_id, text, reply_markup=kb, parse_mode="HTML")
+    m = bot.send_message(chat_id, text, reply_markup=kb, parse_mode="HTML")
+    game["message_id"] = m.message_id; game["chat_id"] = chat_id
 
-@bot.callback_query_handler(func=lambda c: c.data.startswith("mop_"))
-def cb_mines_open(call):
-    uid  = call.from_user.id
-    p    = call.data.split("_")
-    g_uid= int(p[1]); cell = int(p[2])
-    if g_uid != uid: bot.answer_callback_query(call.id, "❌ Не твоя игра"); return
-    game = mines_games.get(uid)
-    if not game: bot.answer_callback_query(call.id, "❌ Игра не найдена"); return
-    if cell in game["opened"]: bot.answer_callback_query(call.id); return
-    if cell in game["mines"]:
-        kb = InlineKeyboardMarkup()
-        for i in range(0, 25, 5):
-            row = []
-            for j in range(5):
-                c2 = i + j
-                if c2 == cell:       row.append(InlineKeyboardButton("💥", callback_data="mno_0"))
-                elif c2 in game["mines"]: row.append(InlineKeyboardButton("💣", callback_data="mno_0"))
-                elif c2 in game["opened"]: row.append(InlineKeyboardButton("💎", callback_data="mno_0"))
-                else:                row.append(InlineKeyboardButton("⬜", callback_data="mno_0"))
-            kb.row(*row)
-        record_game(uid, "мины", game["bet"], 0, f"мина {cell}, открыто {len(game['opened'])}")
-        del mines_games[uid]
-        bot.edit_message_text(
-            f"💥 <b>БУМ!</b> Мина!\nПотеряно: {fmt(game['bet'])} {CURRENCY}\nОткрыто: {len(game['opened'])}",
-            call.message.chat.id, call.message.message_id, reply_markup=kb, parse_mode="HTML"
-        )
-        bot.answer_callback_query(call.id, "💥 МИНА!")
-        return
-    game["opened"].append(cell)
-    safe_total = 25 - game["mines_count"]
-    if len(game["opened"]) >= safe_total:
-        mult = mines_mult(len(game["opened"]), game["mines_count"])
-        win  = int(game["bet"] * mult)
-        update_balance(uid, win)
-        record_game(uid, "мины", game["bet"], win - game["bet"], "все безопасные")
-        bot.edit_message_text(
-            f"🎉 <b>ПОБЕДА! Все мины обойдены!</b>\n+{fmt(win)} {CURRENCY} (×{mult})",
-            call.message.chat.id, call.message.message_id, parse_mode="HTML"
-        )
-        del mines_games[uid]
-        bot.answer_callback_query(call.id, f"🎉 +{fmt(win)}")
-        return
-    bot.answer_callback_query(call.id, "💎 Безопасно!")
-    show_mines_board(uid, call.message.chat.id, call.message.message_id)
-
-@bot.callback_query_handler(func=lambda c: c.data.startswith("mco_"))
-def cb_mines_cashout(call):
-    uid = call.from_user.id
-    if uid != int(call.data.split("_")[1]): bot.answer_callback_query(call.id, "❌"); return
-    game = mines_games.pop(uid, None)
-    if not game: bot.answer_callback_query(call.id, "❌ Игра не найдена"); return
-    if len(game["opened"]) == 0:
-        update_balance(uid, game["bet"])
-        bot.edit_message_text("🏃 Отмена. Ставка возвращена.", call.message.chat.id, call.message.message_id, parse_mode="HTML")
-        bot.answer_callback_query(call.id, "Возвращено"); return
-    mult = mines_mult(len(game["opened"]), game["mines_count"])
-    win  = int(game["bet"] * mult)
-    update_balance(uid, win)
-    record_game(uid, "мины", game["bet"], win - game["bet"], f"кешаут {len(game['opened'])}")
-    bot.edit_message_text(
-        f"💰 <b>Кешаут!</b> {len(game['opened'])} клеток\n+{fmt(win)} {CURRENCY} (×{mult})",
-        call.message.chat.id, call.message.message_id, parse_mode="HTML"
-    )
-    bot.answer_callback_query(call.id, f"✅ +{fmt(win)}")
-
-@bot.callback_query_handler(func=lambda c: c.data.startswith("mex_"))
-def cb_mines_exit(call):
-    uid = call.from_user.id
-    if uid != int(call.data.split("_")[1]): bot.answer_callback_query(call.id, "❌"); return
-    game = mines_games.pop(uid, None)
-    if not game: bot.answer_callback_query(call.id, "❌"); return
-    update_balance(uid, game["bet"])
-    bot.edit_message_text(f"🏃 Выход. Возвращено {fmt(game['bet'])} {CURRENCY}", call.message.chat.id, call.message.message_id, parse_mode="HTML")
-    bot.answer_callback_query(call.id, "✅")
-
-@bot.callback_query_handler(func=lambda c: c.data.startswith("mno_"))
-def cb_mines_noop(call): bot.answer_callback_query(call.id)
-
-# ЛОТЕРЕЯ
-@bot.message_handler(func=lambda m: m.text and m.text.lower().startswith("лотерея"))
-def cmd_lottery(msg):
-    uid = msg.from_user.id
-    u = game_check(msg)
-    if not u: return
+@bot.message_handler(func=lambda m: m.text and m.text.lower().startswith("мины"))
+def cmd_mines(msg):
+    if not game_check(msg): return
+    uid = msg.from_user.id; u = get_user(uid)
+    if uid in active_mines_games:
+        gd = active_mines_games[uid]
+        left = max(0, 240 - (time.time() - gd["start_time"]))
+        reply(msg, f"❌ Уже есть активная игра!\n⏰ Возврат через: {int(left//60)}:{int(left%60):02d}", parse_mode="HTML"); return
     parts = msg.text.split()
-    if len(parts) < 2:
-        with db() as c:
-            c.execute("SELECT jackpot, draw_at FROM lottery WHERE id=1")
-            lotto = c.fetchone()
-            c.execute("SELECT tickets FROM lottery_tickets WHERE user_id=%s", (uid,))
-            my = c.fetchone()
-        jackpot  = lotto["jackpot"] if lotto else 0
-        draw_at  = lotto["draw_at"] if lotto else 0
-        my_t     = my["tickets"] if my else 0
+    if len(parts) < 3:
         reply(msg,
-            f"🎟️ <b>Лотерея</b>\n━━━━━━━━━━━━━━━━━━\n"
-            f"💰 Джекпот: <b>{fmt(jackpot)} {CURRENCY}</b>\n"
-            f"⏰ Розыгрыш: <b>{cd_str(max(0, int(draw_at)-now()))}</b>\n"
-            f"🎫 Твоих билетов: <b>{my_t}</b>\n"
-            f"💵 Цена билета: {fmt(LOTTERY_TICKET_PRICE)}\n\n"
-            f"Введи: <code>лотерея 1000</code>",
+            "💣 <b>Мины</b>\nФормат: <code>мины СТАВКА КОЛ-ВО_МИН</code>\n"
+            "Мин: 1-24\nПример: <code>мины 1000 3</code>\n"
+            "Открывай 🎁, избегай 💣, забирай в любой момент!",
             parse_mode="HTML"); return
-    bet = parse_bet(parts[1], u["balance"])
-    if not bet or bet <= 0 or bet > int(u["balance"]):
-        reply(msg, f"❌ Неверная сумма. Баланс: {fmt(u['balance'])} {CURRENCY}", parse_mode="HTML"); return
-    tickets = bet // LOTTERY_TICKET_PRICE
-    if tickets == 0:
-        reply(msg, f"❌ Минимум {fmt(LOTTERY_TICKET_PRICE)} за 1 билет", parse_mode="HTML"); return
-    cost = tickets * LOTTERY_TICKET_PRICE
-    update_balance(uid, -cost)
-    with db() as c:
-        c.execute("INSERT INTO lottery_tickets (user_id,tickets) VALUES (%s,%s) ON CONFLICT (user_id) DO UPDATE SET tickets=lottery_tickets.tickets+%s",
-                  (uid, tickets, tickets))
-        c.execute("UPDATE lottery SET jackpot=jackpot+%s WHERE id=1", (cost,))
-        c.execute("SELECT jackpot, draw_at FROM lottery WHERE id=1")
-        row = c.fetchone()
-    reply(msg,
-        f"🎟️ Куплено <b>{tickets}</b> билет(ов) за {fmt(cost)} {CURRENCY}\n"
-        f"💰 Джекпот: <b>{fmt(row['jackpot'])} {CURRENCY}</b>\n"
-        f"⏰ Розыгрыш: {cd_str(max(0, int(row['draw_at'])-now()))}",
-        parse_mode="HTML")
+    bet = _parse_bet(parts[1], int(u["balance"]))
+    if not bet or bet < 100:
+        reply(msg, "❌ Мин. ставка: 100", parse_mode="HTML"); return
+    if bet > int(u["balance"]):
+        reply(msg, f"❌ Не хватает монет. Баланс: {fmt(u['balance'])} {CURRENCY}", parse_mode="HTML"); return
+    try:
+        mc = int(parts[2])
+        if mc < 1 or mc > 24: raise ValueError
+    except:
+        reply(msg, "❌ Мин от 1 до 24", parse_mode="HTML"); return
+    update_balance(uid, -bet)
+    active_mines_games[uid] = {
+        "bet": bet, "mines_count": mc, "game_board": _generate_board(mc),
+        "revealed_safe": [], "revealed_mines": [], "opened_cells": 0,
+        "message_id": None, "chat_id": msg.chat.id, "start_time": time.time()
+    }
+    _show_mines(msg.chat.id, uid)
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("mg_"))
+def cb_mines_all(call):
+    uid = call.from_user.id
+    parts = call.data.split("_")
+    action = parts[1]
+    if action == "already":
+        bot.answer_callback_query(call.id, "❌ Уже открыта!"); return
+    if action in ["open", "cash", "exit"]:
+        # Проверяем владельца
+        try: owner = int(parts[2])
+        except: bot.answer_callback_query(call.id); return
+        if uid != owner:
+            bot.answer_callback_query(call.id, "❌ Не твоя игра!"); return
+        game = active_mines_games.get(uid)
+        if not game:
+            bot.answer_callback_query(call.id, "❌ Игра не найдена!"); return
+        if action == "open":
+            idx = int(parts[3])
+            if game["game_board"][idx]:
+                # Мина!
+                game["revealed_mines"].append(idx)
+                # Показываем все мины
+                kb = InlineKeyboardMarkup()
+                for i in range(0, 25, 5):
+                    row = []
+                    for j in range(5):
+                        c2 = i + j
+                        if c2 in game["revealed_mines"]: row.append(InlineKeyboardButton("💣" if c2 != idx else "💥", callback_data="mg_fin"))
+                        elif c2 in game["revealed_safe"]: row.append(InlineKeyboardButton("🎁", callback_data="mg_fin"))
+                        elif game["game_board"][c2]:      row.append(InlineKeyboardButton("💣", callback_data="mg_fin"))
+                        else:                             row.append(InlineKeyboardButton("❇️", callback_data="mg_fin"))
+                    kb.row(*row)
+                kb.row(InlineKeyboardButton("🎲 Новая игра", callback_data=f"mg_new_{uid}"))
+                try:
+                    bot.edit_message_text(
+                        f"💥 <b>МИНА!</b> Открыто: {game['opened_cells']} клеток\nПотеряно: {fmt(game['bet'])} {CURRENCY}",
+                        call.message.chat.id, call.message.message_id, reply_markup=kb, parse_mode="HTML")
+                except: pass
+                record_game(uid, "мины", game["bet"], 0, f"мина, {game['opened_cells']} открыто")
+                del active_mines_games[uid]
+                bot.answer_callback_query(call.id, "💣 МИНА!")
+            else:
+                game["revealed_safe"].append(idx); game["opened_cells"] += 1
+                safe_total = 25 - game["mines_count"]
+                if game["opened_cells"] >= safe_total:
+                    mult = _mines_mult(game["mines_count"], game["opened_cells"])
+                    win  = int(game["bet"] * mult)
+                    update_balance(uid, win)
+                    record_game(uid, "мины", game["bet"], win - game["bet"], "все безопасные")
+                    try:
+                        bot.edit_message_text(f"🏆 <b>ВСЕ КЛЕТКИ ОТКРЫТЫ!</b>\n+{fmt(win)} {CURRENCY} (x{mult:.2f})",
+                            call.message.chat.id, call.message.message_id, parse_mode="HTML")
+                    except: pass
+                    del active_mines_games[uid]
+                    bot.answer_callback_query(call.id, f"🏆 +{fmt(win)}!")
+                else:
+                    bot.answer_callback_query(call.id, "🎁 Безопасно!")
+                    _show_mines(call.message.chat.id, uid, call.message.message_id)
+        elif action == "cash":
+            if game["opened_cells"] == 0:
+                bot.answer_callback_query(call.id, "❌ Сначала откройте клетку!", show_alert=True); return
+            mult = _mines_mult(game["mines_count"], game["opened_cells"])
+            win  = int(game["bet"] * mult)
+            update_balance(uid, win)
+            record_game(uid, "мины", game["bet"], win - game["bet"], f"кешаут {game['opened_cells']}")
+            try:
+                bot.edit_message_text(f"💰 <b>Кешаут!</b> {game['opened_cells']} клеток\n+{fmt(win)} {CURRENCY} (x{mult:.2f})",
+                    call.message.chat.id, call.message.message_id, parse_mode="HTML")
+            except: pass
+            del active_mines_games[uid]
+            bot.answer_callback_query(call.id, f"✅ +{fmt(win)}")
+        elif action == "exit":
+            update_balance(uid, game["bet"])
+            try:
+                bot.edit_message_text(f"🏁 Игра окончена. Возвращено {fmt(game['bet'])} {CURRENCY}",
+                    call.message.chat.id, call.message.message_id, parse_mode="HTML")
+            except: pass
+            del active_mines_games[uid]
+            bot.answer_callback_query(call.id, "✅ Возвращено")
+    elif action == "new":
+        try: owner = int(parts[2])
+        except: bot.answer_callback_query(call.id); return
+        if uid != owner:
+            bot.answer_callback_query(call.id, "❌"); return
+        bot.answer_callback_query(call.id)
+        try: bot.delete_message(call.message.chat.id, call.message.message_id)
+        except: pass
+        bot.send_message(call.message.chat.id,
+            "💣 <b>Мины</b>\nФормат: <code>мины СТАВКА КОЛ-ВО_МИН</code>\n"
+            "Мин: 1-24\nПример: <code>мины 1000 3</code>", parse_mode="HTML")
+    elif action == "fin":
+        bot.answer_callback_query(call.id, "ℹ️ Игра окончена")
+
+# Возврат просроченных игр (4 мин таймаут)
+def _mines_refund_loop():
+    while True:
+        time.sleep(60)
+        expired = [uid for uid, g in list(active_mines_games.items()) if time.time() - g["start_time"] > 240]
+        for uid in expired:
+            g = active_mines_games.pop(uid, None)
+            if g:
+                update_balance(uid, g["bet"])
+                try: bot.send_message(uid, f"⏰ Время игры истекло! Возвращено {fmt(g['bet'])} {CURRENCY}", parse_mode="HTML")
+                except: pass
+threading.Thread(target=_mines_refund_loop, daemon=True).start()
+
 
 # ═══════════════════════════════════════════════════════════════
 # 13. БОНУС
