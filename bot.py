@@ -11,7 +11,7 @@ from datetime import datetime
 # ─────────────────────────────────────────
 #  КОНФИГ
 # ─────────────────────────────────────────
-BOT_TOKEN   = "ВАШ_ТОКЕН"          # @BotFather
+BOT_TOKEN   = "8761494197:AAEAs_0IiN_bnx9520QHCydhpdWbpK5DXXY"          # @BotFather
 ADMIN_ID    = 8139807344            # твой Telegram ID
 DB_PATH     = "casino.db"
 
