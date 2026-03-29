@@ -580,5 +580,10 @@ def run_flask():
 print("🎰 Casino bot запущен...")
 threading.Thread(target=run_flask, daemon=True).start()
 
-# drop_pending_updates=True — сбрасывает старую очередь и убивает конфликт 409
-bot.infinity_polling(allowed_updates=[], drop_pending_updates=True)
+# Сбрасываем очередь чтобы не было 409
+try:
+    bot.delete_webhook(drop_pending_updates=True)
+except Exception:
+    bot.delete_webhook()
+
+bot.infinity_polling()
