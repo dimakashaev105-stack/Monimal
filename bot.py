@@ -501,6 +501,67 @@ def cmd_add(msg):
         pass
 
 # ─────────────────────────────────────────
+#  АДМИН: выгрузка и загрузка базы
+#  /база         — скачать файл БД
+#  /база загрузить — ответить на это сообщение файлом .db
+# ─────────────────────────────────────────
+@bot.message_handler(commands=["база", "db"])
+def cmd_db(msg):
+    if msg.from_user.id != ADMIN_ID:
+        return
+
+    parts = msg.text.strip().split()
+    # /база загрузить — ждём файл
+    if len(parts) > 1 and parts[1].lower() in ("загрузить", "load"):
+        sent = bot.reply_to(msg,
+            "📥 Отправь файл <b>casino.db</b> следующим сообщением.\n"
+            "<b>⚠️ Текущая база будет перезаписана!</b>")
+        bot.register_next_step_handler(sent, receive_db_file)
+        return
+
+    # /база — выгрузить
+    if not os.path.exists(DB_PATH):
+        return bot.reply_to(msg, "❌ Файл базы не найден.")
+
+    with open(DB_PATH, "rb") as f:
+        ts = datetime.now().strftime("%Y%m%d_%H%M")
+        bot.send_document(
+            msg.chat.id,
+            f,
+            caption=f"📦 База данных casino.db\n🕐 {ts}",
+            visible_file_name=f"casino_{ts}.db"
+        )
+
+def receive_db_file(msg):
+    if msg.from_user.id != ADMIN_ID:
+        return
+    if not msg.document:
+        return bot.reply_to(msg, "❌ Это не файл. Отправь .db файл.")
+
+    fname = msg.document.file_name or ""
+    if not fname.endswith(".db"):
+        return bot.reply_to(msg, "❌ Нужен файл с расширением .db")
+
+    # Скачиваем
+    file_info = bot.get_file(msg.document.file_id)
+    downloaded = bot.download_file(file_info.file_path)
+
+    # Бэкап текущей
+    if os.path.exists(DB_PATH):
+        backup = DB_PATH + ".bak"
+        with open(backup, "wb") as f:
+            with open(DB_PATH, "rb") as src:
+                f.write(src.read())
+
+    # Записываем новую
+    with open(DB_PATH, "wb") as f:
+        f.write(downloaded)
+
+    bot.reply_to(msg,
+        "✅ База успешно загружена!\n"
+        "Старая сохранена как <code>casino.db.bak</code>")
+
+# ─────────────────────────────────────────
 #  KEEP-ALIVE (Render free tier)
 # ─────────────────────────────────────────
 app = Flask(__name__)
@@ -510,7 +571,7 @@ def ping():
     return "OK", 200
 
 def run_flask():
-    port = int(os.environ.get("PORT", 8080))
+    port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
 
 # ─────────────────────────────────────────
@@ -518,4 +579,6 @@ def run_flask():
 # ─────────────────────────────────────────
 print("🎰 Casino bot запущен...")
 threading.Thread(target=run_flask, daemon=True).start()
-bot.infinity_polling()
+
+# drop_pending_updates=True — сбрасывает старую очередь и убивает конфликт 409
+bot.infinity_polling(allowed_updates=[], drop_pending_updates=True)
