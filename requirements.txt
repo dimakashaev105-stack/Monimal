@@ -1,4 +1,2 @@
-psycopg2-binary
 pyTelegramBotAPI
-python-dotenv
-requests
+flask
