@@ -97,26 +97,24 @@ def now():
 #  ГЛАВНОЕ МЕНЮ
 # ─────────────────────────────────────────
 def main_menu(user_id):
-    u = get_user(user_id)
     kb = types.InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        types.InlineKeyboardButton("🏀 Баскетбол",  callback_data="game_bsk"),
-        types.InlineKeyboardButton("⚽ Футбол",     callback_data="game_ftb"),
-        types.InlineKeyboardButton("🎯 Дартс",      callback_data="game_darts"),
-        types.InlineKeyboardButton("🎳 Боулинг",    callback_data="game_bowl"),
-        types.InlineKeyboardButton("🎲 Кубик",      callback_data="game_cube"),
-    )
-    kb.add(types.InlineKeyboardButton("💳 Пополнить",  callback_data="deposit"))
-    kb.add(types.InlineKeyboardButton("💸 Вывести",    callback_data="withdraw"))
-    kb.add(types.InlineKeyboardButton("🏆 Топ игроков", callback_data="top"))
-    kb.add(types.InlineKeyboardButton("📊 Мой профиль", callback_data="profile"))
+    kb.add(types.InlineKeyboardButton("💳 Пополнить", callback_data="deposit"))
+    kb.add(types.InlineKeyboardButton("💸 Вывести",   callback_data="withdraw"))
+    kb.add(types.InlineKeyboardButton("🏆 Топ",       callback_data="top"),
+           types.InlineKeyboardButton("📊 Профиль",   callback_data="profile"))
     return kb
 
-MENU_TEXT = """🎰 <b>CASINO</b>
-
-Баланс: <b>{bal} ⭐</b>
-
-Выбери игру или действие:"""
+MENU_TEXT = (
+    "🎰 <b>CASINO</b>\n\n"
+    "Баланс: <b>{bal} ⭐</b>\n\n"
+    "Игры — пиши в чат:\n"
+    "<code>бск 50</code>   — 🏀 Баскетбол\n"
+    "<code>фтб 50</code>   — ⚽ Футбол\n"
+    "<code>дартс 50</code> — 🎯 Дартс\n"
+    "<code>боул 50</code>  — 🎳 Боулинг\n"
+    "<code>куб 50</code>   — 🎲 Кубик\n\n"
+    "Пополнение: <code>пополнить 200</code>"
+)
 
 # ─────────────────────────────────────────
 #  /start
@@ -144,6 +142,13 @@ def get_game_key(text):
     word = text.strip().lstrip("/").lower().split()[0]
     return GAME_KEYS.get(word)
 
+def is_deposit_text(text):
+    """пополнить 200  /  пополнить200  /  deposit 100"""
+    if not text:
+        return False
+    word = text.strip().lstrip("/").lower().split()[0]
+    return word in ("пополнить", "пополни", "deposit", "pay")
+
 @bot.message_handler(commands=["start"])
 def cmd_start(msg):
     u = get_user(msg.from_user.id, msg.from_user.username)
@@ -159,15 +164,11 @@ def cmd_start(msg):
 @bot.message_handler(func=lambda m: get_game_key(m.text) is not None)
 def handle_game(msg):
     key = get_game_key(msg.text)
-    # нормализуем текст: первое слово = ключ, остальное — ставка
     parts = msg.text.strip().split()
-    # подменяем первое слово на нейтральное чтобы parse_bet сработал
     normalized = key + (" " + parts[1] if len(parts) > 1 else "")
-
     bet, err = parse_bet(normalized, msg.from_user.id)
     if err:
         return bot.reply_to(msg, err)
-
     if key == "bsk":
         _play_bsk(msg, bet)
     elif key == "bowl":
@@ -178,6 +179,31 @@ def handle_game(msg):
         _play_cube(msg, bet)
     elif key == "ftb":
         _play_ftb(msg, bet)
+
+# ─────────────────────────────────────────
+#  ТЕКСТОВОЕ ПОПОЛНЕНИЕ: "пополнить 200"
+# ─────────────────────────────────────────
+@bot.message_handler(func=lambda m: is_deposit_text(m.text))
+def handle_deposit_text(msg):
+    parts = msg.text.strip().split()
+    if len(parts) < 2:
+        return bot.reply_to(msg, "Укажи сумму. Пример: <code>пополнить 200</code>")
+    try:
+        amount = int(parts[1])
+    except ValueError:
+        return bot.reply_to(msg, "Сумма должна быть числом. Пример: <code>пополнить 200</code>")
+    if amount < 1:
+        return bot.reply_to(msg, "Минимум 1 ⭐")
+    prices = [types.LabeledPrice(label=f"Пополнение {amount} ⭐", amount=amount)]
+    bot.send_invoice(
+        chat_id=msg.chat.id,
+        title=f"Пополнение {amount} ⭐",
+        description="Баланс в Casino боте",
+        invoice_payload=f"deposit_{amount}",
+        provider_token="",
+        currency="XTR",
+        prices=prices
+    )
 
 # ── БАСКЕТБОЛ ───────────────────────────
 def _play_bsk(msg, bet):
@@ -276,37 +302,32 @@ def _play_ftb(msg, bet):
     bot.reply_to(msg, f"{result_text}\nБаланс: <b>{u['balance']} ⭐</b>")
 
 # ─────────────────────────────────────────
-#  INLINE CALLBACKS
-# ─────────────────────────────────────────
-@bot.callback_query_handler(func=lambda c: c.data.startswith("game_"))
-def cb_game(call):
-    game_map = {
-        "game_bsk":   ("🏀 Баскетбол", "бск"),
-        "game_ftb":   ("⚽ Футбол",    "фтб"),
-        "game_darts": ("🎯 Дартс",     "дартс"),
-        "game_bowl":  ("🎳 Боулинг",   "боул"),
-        "game_cube":  ("🎲 Кубик",     "куб"),
-    }
-    name, cmd = game_map[call.data]
-    bot.answer_callback_query(call.id)
-    bot.send_message(call.message.chat.id,
-        f"{name}\n\nВведи команду и ставку:\n<code>{cmd} &lt;сумма&gt;</code>\nПример: <code>{cmd} 50</code>")
-
-# ─────────────────────────────────────────
 #  ПОПОЛНЕНИЕ (Telegram Stars)
 # ─────────────────────────────────────────
 @bot.callback_query_handler(func=lambda c: c.data == "deposit")
 def cb_deposit(call):
     bot.answer_callback_query(call.id)
-    kb = types.InlineKeyboardMarkup(row_width=3)
-    for amount in [50, 100, 200, 500, 1000]:
-        kb.add(types.InlineKeyboardButton(
-            f"⭐ {amount}",
-            callback_data=f"pay_{amount}"
-        ))
-    bot.send_message(call.message.chat.id,
-        "💳 <b>Пополнение баланса</b>\n\nВыбери сумму (в Telegram Stars):",
-        reply_markup=kb)
+    sent = bot.send_message(call.message.chat.id,
+        "💳 <b>Пополнение</b>\n\nВведи сумму в Stars:")
+    bot.register_next_step_handler(sent, process_deposit_amount)
+
+def process_deposit_amount(msg):
+    try:
+        amount = int(msg.text.strip())
+    except:
+        return bot.reply_to(msg, "Введи число. Пример: <code>200</code>")
+    if amount < 1:
+        return bot.reply_to(msg, "Минимум 1 ⭐")
+    prices = [types.LabeledPrice(label=f"Пополнение {amount} ⭐", amount=amount)]
+    bot.send_invoice(
+        chat_id=msg.chat.id,
+        title=f"Пополнение {amount} ⭐",
+        description="Баланс в Casino боте",
+        invoice_payload=f"deposit_{amount}",
+        provider_token="",
+        currency="XTR",
+        prices=prices
+    )
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("pay_"))
 def cb_pay(call):
@@ -318,7 +339,7 @@ def cb_pay(call):
         title=f"Пополнение {amount} ⭐",
         description="Баланс в Casino боте",
         invoice_payload=f"deposit_{amount}",
-        provider_token="",          # пусто = Telegram Stars
+        provider_token="",
         currency="XTR",
         prices=prices
     )
