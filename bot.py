@@ -1,4 +1,6 @@
 import telebot
+import threading
+from flask import Flask
 from telebot import types
 import sqlite3
 import random
@@ -9,7 +11,7 @@ from datetime import datetime
 # ─────────────────────────────────────────
 #  КОНФИГ
 # ─────────────────────────────────────────
-BOT_TOKEN   = "8761494197:AAEAs_0IiN_bnx9520QHCydhpdWbpK5DXXY"          # @BotFather
+BOT_TOKEN   = "ВАШ_ТОКЕН"          # @BotFather
 ADMIN_ID    = 8139807344            # твой Telegram ID
 DB_PATH     = "casino.db"
 
@@ -499,7 +501,21 @@ def cmd_add(msg):
         pass
 
 # ─────────────────────────────────────────
+#  KEEP-ALIVE (Render free tier)
+# ─────────────────────────────────────────
+app = Flask(__name__)
+
+@app.route("/")
+def ping():
+    return "OK", 200
+
+def run_flask():
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
+
+# ─────────────────────────────────────────
 #  ЗАПУСК
 # ─────────────────────────────────────────
 print("🎰 Casino bot запущен...")
+threading.Thread(target=run_flask, daemon=True).start()
 bot.infinity_polling()
