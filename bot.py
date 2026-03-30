@@ -104,6 +104,7 @@ def main_menu(user_id):
     kb.add(types.InlineKeyboardButton("💸 Вывести",   callback_data="withdraw"))
     kb.add(types.InlineKeyboardButton("🏆 Топ",       callback_data="top"),
            types.InlineKeyboardButton("📊 Профиль",   callback_data="profile"))
+    kb.add(types.InlineKeyboardButton("🆘 Поддержка", url="https://t.me/Cary_python"))
     return kb
 
 MENU_TEXT = (
